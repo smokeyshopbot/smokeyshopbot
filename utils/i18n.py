@@ -252,6 +252,7 @@ TEXT = {
         "payment_expired_body": "The payment was not completed within *{minutes} minutes*.\n\nPlease start a new wallet top-up.",
         "order_expired_body": "The payment was not completed within *{minutes} minutes*.\n\nPlease create a new order.",
         # User notifications
+        "new_product_added": "🆕 <b>New Product Added!</b>\n\n<b>{product}</b> is available now.\n{lines}\n\nTap below to buy.",
         "fresh_stock_added": "📦 <b>Fresh Stock Added!</b>\n\n<b>{product}</b> is available now.\n🛒 Available stock: <b>{stock}</b>\n\nTap below to buy.",
         "price_dropped": "🔻 <b>Price Dropped!</b>\n\n<b>{product}</b> price is lower now.\n{lines}\n\nTap below to buy.",
         "order_expired_admin_reason": "This pending order was expired by admin.",
@@ -478,6 +479,7 @@ TEXT = {
         "order_expired_title": "⏰ *Pedido expirado*",
         "payment_expired_body": "El pago no se completó dentro de *{minutes} minutos*.\n\nInicia una nueva recarga de billetera.",
         "order_expired_body": "El pago no se completó dentro de *{minutes} minutos*.\n\nCrea un nuevo pedido.",
+        "new_product_added": "🆕 <b>¡Nuevo producto agregado!</b>\n\n<b>{product}</b> está disponible ahora.\n{lines}\n\nToca abajo para comprar.",
         "fresh_stock_added": "📦 <b>¡Nuevo stock agregado!</b>\n\n<b>{product}</b> está disponible ahora.\n🛒 Stock disponible: <b>{stock}</b>\n\nToca abajo para comprar.",
         "price_dropped": "🔻 <b>¡Precio rebajado!</b>\n\nEl precio de <b>{product}</b> bajó.\n{lines}\n\nToca abajo para comprar.",
         "order_expired_admin_reason": "Este pedido pendiente fue expirado por el admin.",

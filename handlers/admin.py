@@ -109,6 +109,32 @@ async def _notify_active_users(bot, text: str, *, product_name: str, parse_mode:
     return sent
 
 
+async def notify_users_new_product(bot, product: dict) -> int:
+    if not product or product.get("enabled", True) is False:
+        return 0
+    product_name = str(product.get("name") or "Product")
+    product_label = html.escape(product_name, quote=False)
+    lines = []
+    try:
+        if product.get("price_inr") is not None:
+            lines.append(f"💰 {_price_inr(product.get('price_inr'))}")
+    except Exception:
+        pass
+    try:
+        if product.get("price_usdt") is not None:
+            lines.append(f"💰 {_price_usdt(product.get('price_usdt'))}")
+    except Exception:
+        pass
+    price_lines = "\n".join(html.escape(line, quote=False) for line in lines)
+    text = (
+        "🆕 <b>New Product Added!</b>\n\n"
+        f"<b>{product_label}</b> is available now.\n"
+        f"{price_lines}\n\n"
+        "Tap below to buy."
+    )
+    return await _notify_active_users(bot, text, product_name=product_name)
+
+
 async def notify_users_new_stock(bot, product_name: str, available_stock: int | None = None) -> int:
     product = await db.get_product(product_name)
     if not product or product.get("enabled", True) is False:
@@ -288,8 +314,10 @@ async def cmd_add_product(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     success = await db.add_product(name, price_inr, price_usdt)
     if success:
+        product = await db.get_product(name) or {"name": name, "price_inr": price_inr, "price_usdt": price_usdt, "enabled": True}
+        notified = await notify_users_new_product(context.bot, product)
         await update.message.reply_text(
-            f"✅ Product *{name}* added!\n💰 ₹{price_inr} / ${price_usdt} USDT\n📦 Stock: 0",
+            f"✅ Product *{name}* added!\n💰 ₹{price_inr} / ${price_usdt} USDT\n📦 Stock: 0\n🔔 Notified {notified} user(s).",
             parse_mode="Markdown"
         )
     else:
