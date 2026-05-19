@@ -230,9 +230,51 @@ async def deduct_wallet_usdt(user_id: int, amount: float) -> bool:
 
 # ─────────────────────────── PRODUCTS ────────────────────────
 
+
+def parse_product_shop_order(value, default=None):
+    """Return a safe product display order value or default.
+
+    Lower numbers appear first in the Telegram shop. Missing/blank legacy
+    products stay in automatic/newest-first order after explicitly ordered
+    products. This helper never writes to the database, so it is safe for
+    existing data.
+    """
+    try:
+        order = int(str(value).strip())
+    except (TypeError, ValueError):
+        return default
+    return order if order >= 1 else default
+
+
+def _sort_dt_value(value) -> float:
+    if isinstance(value, datetime):
+        dt = value
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        return dt.timestamp()
+    return 0.0
+
+
+def product_shop_sort_key(product: dict) -> tuple:
+    """Sort key used everywhere products are shown to buyers/admins.
+
+    Explicit shop_order values come first from low to high. Products without a
+    saved shop_order keep the previous automatic newest-first behavior.
+    """
+    order = parse_product_shop_order((product or {}).get("shop_order"))
+    if order is not None:
+        return (0, order, -_sort_dt_value((product or {}).get("created_at")), str((product or {}).get("name") or "").lower())
+    return (1, 0, -_sort_dt_value((product or {}).get("created_at")), str((product or {}).get("name") or "").lower())
+
+
+def sort_products_for_shop(products: list[dict]) -> list[dict]:
+    return sorted(products, key=product_shop_sort_key)
+
+
 async def get_all_products() -> list[dict]:
-    """Return products newest first."""
-    return await get_db().products.find().sort("created_at", -1).to_list(length=None)
+    """Return products in Telegram shop display order."""
+    products = await get_db().products.find().to_list(length=None)
+    return sort_products_for_shop(products)
 
 
 async def get_product(name: str) -> Optional[dict]:
@@ -247,11 +289,11 @@ async def get_product_by_id(product_id: str) -> Optional[dict]:
     return await get_db().products.find_one({"_id": oid})
 
 
-async def add_product(name: str, price_inr: float, price_usdt: float) -> bool:
+async def add_product(name: str, price_inr: float, price_usdt: float, shop_order: int | None = None) -> bool:
     existing = await get_product(name)
     if existing:
         return False
-    await get_db().products.insert_one({
+    doc = {
         "name": name,
         "price_inr": price_inr,
         "price_usdt": price_usdt,
@@ -262,8 +304,35 @@ async def add_product(name: str, price_inr: float, price_usdt: float) -> bool:
         "low_stock_threshold": 10,
         "low_stock_alert_sent": False,
         "created_at": datetime.now(timezone.utc),
-    })
+    }
+    parsed_order = parse_product_shop_order(shop_order)
+    if parsed_order is not None:
+        doc["shop_order"] = parsed_order
+    await get_db().products.insert_one(doc)
     return True
+
+
+async def set_product_shop_order(name: str, shop_order: int | None) -> bool:
+    """Set or clear a product's Telegram shop display order.
+
+    Passing None clears the custom order, returning the product to automatic
+    newest-first placement after explicitly ordered products.
+    """
+    parsed_order = parse_product_shop_order(shop_order)
+    if parsed_order is None:
+        update = {
+            "$unset": {"shop_order": ""},
+            "$set": {"updated_at": datetime.now(timezone.utc)},
+        }
+    else:
+        update = {
+            "$set": {
+                "shop_order": parsed_order,
+                "updated_at": datetime.now(timezone.utc),
+            }
+        }
+    res = await get_db().products.update_one({"name": _name_regex(name)}, update)
+    return res.matched_count > 0
 
 
 async def remove_product(name: str) -> bool:
@@ -518,11 +587,13 @@ async def get_all_products_with_availability(include_disabled: bool = False) -> 
     else:
         products = await get_db().products.find({
             "$or": [{"enabled": True}, {"enabled": {"$exists": False}}]
-        }).sort("created_at", -1).to_list(length=None)
+        }).to_list(length=None)
+        products = sort_products_for_shop(products)
     for product in products:
         actual_stock = len(product.get("stock", []) or [])
         pending_qty = await get_pending_stock_quantity(product.get("name", ""))
         product["enabled"] = product.get("enabled", True)
+        product["shop_order"] = parse_product_shop_order(product.get("shop_order"), default=None)
         product["actual_stock"] = actual_stock
         product["pending_stock_quantity"] = pending_qty
         product["available_stock"] = max(0, actual_stock - pending_qty)
