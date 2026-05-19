@@ -23,11 +23,22 @@ from config import SUPPORT_USERNAMES
 from utils.crypto import generate_unique_usdt_amount
 from utils.messages import commands_text, compact_blank_lines, md_code, telegram_id, order_amount_text
 from utils.i18n import tr, language_name, normalize_lang, SUPPORTED_LANGUAGES
+from handlers.replacements import start_report_from_query
 
 # Track users in shopping flow: { user_id: { step, product_name, quantity } }
 _shop_flow: dict[int, dict] = {}
 
+
+def clear_shop_flow(user_id: int | str | None) -> None:
+    """Clear any active shopping quantity/payment session for this user."""
+    try:
+        uid = int(user_id or 0)
+    except (TypeError, ValueError):
+        return
+    _shop_flow.pop(uid, None)
+
 ORDERS_PAGE_SIZE = 10
+REPLACEMENTS_PAGE_SIZE = 10
 
 
 async def _user_lang(user_id: int) -> str:
@@ -171,8 +182,12 @@ def _main_menu_keyboard(user_id: int, lang: str = "en") -> InlineKeyboardMarkup:
             InlineKeyboardButton(tr(lang, "btn_wallet"), callback_data="nav:wallet"),
         ],
         [InlineKeyboardButton(tr(lang, "btn_topup"), callback_data="nav:loadwallet")],
-        [InlineKeyboardButton(tr(lang, "btn_orders"), callback_data="nav:orders")],
+        [
+            InlineKeyboardButton(tr(lang, "btn_orders"), callback_data="nav:orders"),
+            InlineKeyboardButton(tr(lang, "btn_replacements"), callback_data="nav:replacements"),
+        ],
         [InlineKeyboardButton(tr(lang, "btn_favorites"), callback_data="nav:favorites")],
+        [InlineKeyboardButton(tr(lang, "btn_report"), callback_data="nav:report")],
         [InlineKeyboardButton(tr(lang, "btn_commands"), callback_data="nav:commands")],
         [InlineKeyboardButton(tr(lang, "btn_language"), callback_data="nav:language")],
         [InlineKeyboardButton(tr(lang, "btn_support"), callback_data="nav:support")],
@@ -404,6 +419,8 @@ def _format_user_orders_text(orders: list[dict], page: int = 0, total_count: int
 def _order_items_txt_filename(order: dict) -> str:
     order_id = str(order.get("order_id") or "order").strip() or "order"
     safe_order_id = "".join(ch for ch in order_id if ch.isalnum() or ch in ("-", "_")).strip() or "order"
+    if order.get("is_replacement"):
+        return f"replacement_{safe_order_id}_items.txt"
     return f"order_{safe_order_id}_items.txt"
 
 
@@ -412,14 +429,19 @@ def _order_items_txt_content(order: dict, lang: str = "en") -> str:
     product_name = str(order.get("product_name", "Product"))
     items = order.get("items", []) or []
     quantity = int(order.get("quantity", len(items) or 0) or 0)
+    is_replacement = bool(order.get("is_replacement"))
     lines = [
-        tr(lang, "order_items_title"),
-        f"{tr(lang, 'order_id')}: {order_id}",
+        tr(lang, "replacement_items_title") if is_replacement else tr(lang, "order_items_title"),
+        f"{tr(lang, 'replacement_id') if is_replacement else tr(lang, 'order_id')}: {order_id}",
+    ]
+    if is_replacement and order.get("replacement_report_id"):
+        lines.append(f"{tr(lang, 'report_id')}: {order.get('replacement_report_id')}")
+    lines.extend([
         f"{tr(lang, 'product')}: {product_name}",
         f"{tr(lang, 'quantity')}: {quantity}",
         "",
         f"{tr(lang, 'items_label')}:",
-    ]
+    ])
     for item in items:
         lines.extend([str(item).strip(), ""])
     return "\n".join(lines).rstrip() + "\n"
@@ -429,6 +451,16 @@ def _order_items_caption(order: dict, *, is_refetch: bool = False, lang: str = "
     order_id = str(order.get("order_id") or "N/A")
     product_name = str(order.get("product_name") or "Product")
     quantity = int(order.get("quantity", 0) or 0)
+    is_replacement = bool(order.get("is_replacement"))
+    if is_replacement:
+        title = tr(lang, "previous_replacement_items") if is_refetch else tr(lang, "replacement_sent_admin")
+        return (
+            f"{title}\n\n"
+            f"🧾 {tr(lang, 'replacement_id')}: {order_id}\n"
+            f"🛠 {tr(lang, 'report_id')}: {order.get('replacement_report_id', 'N/A')}\n"
+            f"📦 {tr(lang, 'product')}: {product_name}\n"
+            f"🔢 {tr(lang, 'quantity')}: {quantity}"
+        )
     title = tr(lang, "previous_order_items") if is_refetch else tr(lang, "order_placed_confirmed")
     return (
         f"{title}\n\n"
@@ -457,10 +489,12 @@ def _format_order_delivery_text(order: dict, *, is_refetch: bool = False, lang: 
     quantity = order.get("quantity", 0)
     status = order.get("status", "unknown")
     items = order.get("items", []) or []
+    is_replacement = bool(order.get("is_replacement"))
+    id_label = tr(lang, "replacement_id") if is_replacement else tr(lang, "order_id")
 
     if status != "delivered" or not items:
         return (
-            f"📦 *{tr(lang, 'order_id')} `{order_id}`*\n\n"
+            f"📦 *{id_label} `{order_id}`*\n\n"
             f"{tr(lang, 'product')}: *{product_name}* x{quantity}\n"
             f"{tr(lang, 'date_time')}: {_format_dt(order.get('created_at'))}\n"
             f"{tr(lang, 'payment_method')}: {str(order.get('payment_method', 'N/A')).upper()}\n"
@@ -468,10 +502,17 @@ def _format_order_delivery_text(order: dict, *, is_refetch: bool = False, lang: 
             f"{tr(lang, 'no_delivered_items')}"
         )
 
-    title = f"📦 *{tr(lang, 'previous_order_items').replace('📄 ', '')}*" if is_refetch else f"✅ *{tr(lang, 'order_items_title')}*"
+    if is_replacement:
+        title = f"🎁 *{tr(lang, 'previous_replacement_items').replace('📄 ', '')}*" if is_refetch else f"✅ *{tr(lang, 'replacement_items_title')}*"
+    else:
+        title = f"📦 *{tr(lang, 'previous_order_items').replace('📄 ', '')}*" if is_refetch else f"✅ *{tr(lang, 'order_items_title')}*"
     text = (
         f"{title}\n\n"
-        f"{tr(lang, 'order_id')}: `{order_id}`\n"
+        f"{id_label}: `{order_id}`\n"
+    )
+    if is_replacement and order.get("replacement_report_id"):
+        text += f"{tr(lang, 'report_id')}: `{order.get('replacement_report_id')}`\n"
+    text += (
         f"{tr(lang, 'date_time')}: {_format_dt(order.get('created_at'))}\n"
         f"{tr(lang, 'payment_method')}: {str(order.get('payment_method', 'N/A')).upper()}\n"
         f"{tr(lang, 'delivered')}: {_format_dt(order.get('delivered_at'))}\n"
@@ -498,6 +539,50 @@ def _orders_keyboard(page: int = 0, total_count: int = 0, lang: str = "en") -> I
         buttons.append(nav_buttons)
 
     buttons.append([InlineKeyboardButton(tr(lang, "btn_shop_again"), callback_data="nav:shop")])
+    buttons.append(_back_button(lang))
+    return InlineKeyboardMarkup(buttons)
+
+
+def _format_user_replacements_text(replacements: list[dict], page: int = 0, total_count: int | None = None, lang: str = "en") -> str:
+    if not replacements:
+        return tr(lang, "replacements_empty")
+
+    total_pages = 1
+    if total_count is not None and total_count > 0:
+        total_pages = max(1, ((total_count - 1) // REPLACEMENTS_PAGE_SIZE) + 1)
+
+    lines = [
+        tr(lang, "replacements_header", page=page + 1, total_pages=total_pages),
+        tr(lang, "replacements_hint"),
+    ]
+    for order in replacements:
+        order_id = order.get("order_id", "N/A")
+        report_id = order.get("replacement_report_id", "N/A")
+        original_orders = ", ".join(str(x) for x in (order.get("original_order_ids") or []) if str(x).strip()) or str(order.get("original_order_id") or "N/A")
+        lines.extend([
+            f"{tr(lang, 'replacement_id')}: `{order_id}`",
+            f"{tr(lang, 'report_id')}: `{report_id}`",
+            f"{tr(lang, 'date_time')}: {_format_dt(order.get('created_at'))}",
+            f"{tr(lang, 'product')}: *{order.get('product_name', 'N/A')}* x{order.get('quantity', 0)}",
+            f"{tr(lang, 'original_order')}: `{original_orders}`",
+            f"{tr(lang, 'status')}: {_status_emoji(order.get('status'))} {_status_label(order.get('status'), lang)}",
+            f"{tr(lang, 'fetch_again')}: {_getorder_shortcut(order_id)}",
+            "",
+        ])
+    return compact_blank_lines("\n".join(lines))
+
+
+def _replacements_keyboard(page: int = 0, total_count: int = 0, lang: str = "en") -> InlineKeyboardMarkup:
+    total_pages = max(1, ((total_count - 1) // REPLACEMENTS_PAGE_SIZE) + 1) if total_count else 1
+    buttons: list[list[InlineKeyboardButton]] = []
+    nav_buttons: list[InlineKeyboardButton] = []
+    if page > 0:
+        nav_buttons.append(InlineKeyboardButton(tr(lang, "btn_prev"), callback_data=f"nav:replacements:{page - 1}"))
+    if page + 1 < total_pages:
+        nav_buttons.append(InlineKeyboardButton(tr(lang, "btn_next"), callback_data=f"nav:replacements:{page + 1}"))
+    if nav_buttons:
+        buttons.append(nav_buttons)
+    buttons.append([InlineKeyboardButton(tr(lang, "btn_orders"), callback_data="nav:orders")])
     buttons.append(_back_button(lang))
     return InlineKeyboardMarkup(buttons)
 
@@ -656,6 +741,24 @@ async def cmd_orders(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
 
+async def cmd_replacements(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Shows the caller's replacement delivery history separately from purchases."""
+    user_id = update.effective_user.id
+    await db.upsert_user(user_id, update.effective_user.username or "")
+    lang = await _user_lang(user_id)
+    if await db.is_blocked(user_id):
+        await update.message.reply_text(tr(lang, "blocked"))
+        return
+
+    total_count = await db.count_user_replacement_orders(user_id)
+    replacements = await db.get_user_replacement_orders(user_id, limit=REPLACEMENTS_PAGE_SIZE, skip=0)
+    await update.message.reply_text(
+        _format_user_replacements_text(replacements, page=0, total_count=total_count, lang=lang),
+        parse_mode="Markdown",
+        reply_markup=_replacements_keyboard(page=0, total_count=total_count, lang=lang)
+    )
+
+
 async def handle_get_order_lookup(update: Update, context: ContextTypes.DEFAULT_TYPE) -> bool:
     """Handles tappable /getorderORDERID shortcuts without listing it as a public command."""
     user_id = update.effective_user.id
@@ -787,6 +890,26 @@ async def handle_nav_buttons(update: Update, context: ContextTypes.DEFAULT_TYPE)
         )
         return
 
+    if base_action == "replacements":
+        _shop_flow.pop(user_id, None)
+        _clear_wallet_flow_if_available(user_id)
+        try:
+            page = int(action_parts[1]) if len(action_parts) > 1 else 0
+        except (TypeError, ValueError):
+            page = 0
+        page = max(0, page)
+        total_count = await db.count_user_replacement_orders(user_id)
+        total_pages = max(1, ((total_count - 1) // REPLACEMENTS_PAGE_SIZE) + 1) if total_count else 1
+        if page >= total_pages:
+            page = total_pages - 1
+        replacements = await db.get_user_replacement_orders(user_id, limit=REPLACEMENTS_PAGE_SIZE, skip=page * REPLACEMENTS_PAGE_SIZE)
+        await query.edit_message_text(
+            _format_user_replacements_text(replacements, page=page, total_count=total_count, lang=lang),
+            parse_mode="Markdown",
+            reply_markup=_replacements_keyboard(page=page, total_count=total_count, lang=lang)
+        )
+        return
+
     if base_action == "favorites":
         _shop_flow.pop(user_id, None)
         _clear_wallet_flow_if_available(user_id)
@@ -832,6 +955,12 @@ async def handle_nav_buttons(update: Update, context: ContextTypes.DEFAULT_TYPE)
             parse_mode="Markdown",
             reply_markup=_favorites_edit_keyboard(products, payment_settings, favorite_names, lang)
         )
+        return
+
+    if base_action == "report":
+        _shop_flow.pop(user_id, None)
+        _clear_wallet_flow_if_available(user_id)
+        await start_report_from_query(update, context)
         return
 
     if base_action == "commands":

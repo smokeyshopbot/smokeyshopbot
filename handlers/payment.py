@@ -132,6 +132,22 @@ def is_payment_manual_input_active(user_id: int | str | None) -> bool:
     return uid in _upi_collection or uid in _binance_collection or uid in _usdt_manual
 
 
+def clear_payment_manual_flows(user_id: int | str | None) -> None:
+    """Cancel any active manual payment proof collection for this user.
+
+    This only clears in-memory input steps. It does not cancel or expire the
+    actual pending payment record, so the user can still press manual verify
+    again from the payment page if needed.
+    """
+    try:
+        uid = int(user_id or 0)
+    except (TypeError, ValueError):
+        return
+    _upi_collection.pop(uid, None)
+    _binance_collection.pop(uid, None)
+    _usdt_manual.pop(uid, None)
+
+
 def _details_from_pending(pending: dict | None) -> dict:
     details = (pending or {}).get("payment_details") or {}
     return details if isinstance(details, dict) else {}
@@ -1041,6 +1057,8 @@ async def _send_pending_stock_notice(bot, user_id: int, order: dict, *, queued: 
 def _delivery_txt_filename(order: dict) -> str:
     order_id = str(order.get("order_id") or "order").strip() or "order"
     safe_order_id = "".join(ch for ch in order_id if ch.isalnum() or ch in ("-", "_")).strip() or "order"
+    if order.get("is_replacement"):
+        return f"replacement_{safe_order_id}_items.txt"
     return f"order_{safe_order_id}_items.txt"
 
 
@@ -1065,6 +1083,15 @@ def _delivery_caption(order: dict, *, from_pending: bool = False, lang: str = "e
     order_id = str(order.get("order_id") or "N/A")
     product_name = str(order.get("product_name") or "Product")
     quantity = int(order.get("quantity", 0) or 0)
+    if order.get("is_replacement"):
+        title = tr(lang, "replacement_resent_admin") if order.get("resent_by_admin") else tr(lang, "replacement_sent_admin")
+        return (
+            f"{title}\n\n"
+            f"🧾 {tr(lang, 'replacement_id')}: {order_id}\n"
+            f"🛠 {tr(lang, 'report_id')}: {order.get('replacement_report_id', 'N/A')}\n"
+            f"📦 {tr(lang, 'product')}: {product_name}\n"
+            f"🔢 {tr(lang, 'quantity')}: {quantity}"
+        )
     title = tr(lang, "pending_order_delivered") if from_pending else tr(lang, "order_placed_confirmed")
     if order.get("resent_by_admin"):
         title = tr(lang, "order_resent_admin")

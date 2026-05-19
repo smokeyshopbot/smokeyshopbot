@@ -43,7 +43,7 @@ from utils.wallet_history import (
 )
 
 import database as db
-from config import ADMIN_IDS, is_admin_id
+from config import ADMIN_IDS, LOW_STOCK_ALERT_THRESHOLD, RESTOCK_NOTIFICATION_COOLDOWN_MINUTES, is_admin_id
 
 # Track admins waiting to add stock: { user_id: product_name }
 _awaiting_stock: dict[int, str] = {}
@@ -1557,6 +1557,7 @@ async def handle_stock_input(update: Update, context: ContextTypes.DEFAULT_TYPE)
         await update.message.reply_text("❌ No valid items found. Try again or send `/cancel`.", parse_mode="Markdown")
         return True
 
+    previous_available = await db.get_available_stock_count(product_name)
     count = await db.add_stock(product_name, blocks)
     skipped_count = max(0, len(blocks) - count)
 
@@ -1572,7 +1573,17 @@ async def handle_stock_input(update: Update, context: ContextTypes.DEFAULT_TYPE)
 
     delivered_orders = delivery_summary.get("orders_delivered", 0)
     delivered_items = delivery_summary.get("items_delivered", 0)
-    if count > 0 and available > 0:
+    should_notify_restock = (
+        count > 0
+        and await db.claim_restock_notification_slot(
+            product_name,
+            previous_available,
+            available,
+            cooldown_minutes=RESTOCK_NOTIFICATION_COOLDOWN_MINUTES,
+            default_threshold=LOW_STOCK_ALERT_THRESHOLD,
+        )
+    )
+    if should_notify_restock:
         await notify_users_new_stock(context.bot, product_name, available)
 
     skipped_line = f"↩️ Skipped duplicate item(s): *{skipped_count}*\n" if skipped_count else ""

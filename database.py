@@ -11,6 +11,7 @@ Collections:
 
 from __future__ import annotations
 import re
+import hashlib
 import time
 import uuid
 from datetime import datetime, timezone, timedelta
@@ -18,6 +19,7 @@ from typing import Optional
 
 from motor.motor_asyncio import AsyncIOMotorClient
 from pymongo import ReturnDocument
+from pymongo.errors import DuplicateKeyError
 from bson import ObjectId
 from config import MONGO_URI, DB_NAME
 
@@ -193,23 +195,37 @@ async def add_wallet_usdt(user_id: int, amount: float):
 
 
 async def deduct_wallet_inr(user_id: int, amount: float) -> bool:
-    user = await get_user(user_id)
-    if not user or user.get("wallet_inr", 0) < amount:
+    """Atomically deduct INR wallet balance only when enough balance exists.
+
+    The balance check and deduction happen in one MongoDB update, preventing two
+    fast wallet-payment clicks from both spending the same balance.
+    """
+    try:
+        amount = round(float(amount or 0), 2)
+    except (TypeError, ValueError):
         return False
-    await get_db().users.update_one(
-        {"user_id": user_id}, {"$inc": {"wallet_inr": -round(amount, 2)}}
+    if amount <= 0:
+        return False
+    result = await get_db().users.update_one(
+        {"user_id": user_id, "wallet_inr": {"$gte": amount}},
+        {"$inc": {"wallet_inr": -amount}},
     )
-    return True
+    return bool(result.modified_count)
 
 
 async def deduct_wallet_usdt(user_id: int, amount: float) -> bool:
-    user = await get_user(user_id)
-    if not user or user.get("wallet_usdt", 0) < amount:
+    """Atomically deduct USDT wallet balance only when enough balance exists."""
+    try:
+        amount = round(float(amount or 0), 6)
+    except (TypeError, ValueError):
         return False
-    await get_db().users.update_one(
-        {"user_id": user_id}, {"$inc": {"wallet_usdt": -round(amount, 6)}}
+    if amount <= 0:
+        return False
+    result = await get_db().users.update_one(
+        {"user_id": user_id, "wallet_usdt": {"$gte": amount}},
+        {"$inc": {"wallet_usdt": -amount}},
     )
-    return True
+    return bool(result.modified_count)
 
 
 # ─────────────────────────── PRODUCTS ────────────────────────
@@ -433,6 +449,62 @@ async def get_available_stock_count(product_name: str) -> int:
     pending_qty = await get_pending_stock_quantity(product_name)
     return max(0, actual - pending_qty)
 
+def get_product_restock_threshold(product: dict | None, default: int = 10) -> int:
+    try:
+        return max(1, int((product or {}).get("low_stock_threshold") or default or 10))
+    except Exception:
+        return max(1, int(default or 10))
+
+
+async def claim_restock_notification_slot(
+    product_name: str,
+    previous_available_stock: int,
+    current_available_stock: int,
+    *,
+    cooldown_minutes: int = 60,
+    default_threshold: int = 10,
+) -> bool:
+    """Return True once when stock recovers from low to healthy.
+
+    The recovery trigger uses available stock, not raw stock, so paid
+    pending-stock orders are fulfilled first and users are notified only when
+    stock is actually available for new buyers. A per-product cooldown prevents
+    notification spam when stock repeatedly moves around the threshold.
+    """
+    product = await get_db().products.find_one(
+        {"name": _name_regex(product_name)},
+        {"_id": 1, "name": 1, "enabled": 1, "low_stock_threshold": 1},
+    )
+    if not product or product.get("enabled", True) is False:
+        return False
+    try:
+        previous_available_stock = int(previous_available_stock or 0)
+        current_available_stock = int(current_available_stock or 0)
+    except Exception:
+        return False
+    threshold = get_product_restock_threshold(product, default_threshold)
+    if previous_available_stock >= threshold or current_available_stock < threshold:
+        return False
+
+    try:
+        cooldown = max(1, int(cooldown_minutes or 60))
+    except Exception:
+        cooldown = 60
+    now = datetime.now(timezone.utc)
+    cutoff = now - timedelta(minutes=cooldown)
+    result = await get_db().products.update_one(
+        {
+            "_id": product["_id"],
+            "$or": [
+                {"restock_notification_last_sent_at": {"$exists": False}},
+                {"restock_notification_last_sent_at": None},
+                {"restock_notification_last_sent_at": {"$lte": cutoff}},
+            ],
+        },
+        {"$set": {"restock_notification_last_sent_at": now}},
+    )
+    return bool(result.modified_count)
+
 
 async def get_all_products_with_availability(include_disabled: bool = False) -> list[dict]:
     """Return products with available_stock and pending_stock_quantity fields.
@@ -476,12 +548,16 @@ async def create_order(
     amount_usdt: float,
     username: str = "",
 ) -> str:
-    order_id = str(uuid.uuid4())[:8].upper()
+    """Create an order with duplicate-safe order-id generation.
+
+    Existing public order IDs stay short. If a rare collision happens, the insert
+    is retried with a new ID instead of overwriting or failing the checkout.
+    """
     username = (username or "").strip().lstrip("@")
     if username:
         await upsert_user(user_id, username)
-    await get_db().orders.insert_one({
-        "order_id": order_id,
+
+    order_doc_base = {
         "user_id": user_id,
         "username": username,
         "product_name": product_name,
@@ -493,8 +569,25 @@ async def create_order(
         "status": "pending",
         "created_at": datetime.now(timezone.utc),
         "delivered_at": None,
-    })
-    return order_id
+    }
+
+    database = get_db()
+    for attempt in range(25):
+        # Keep the familiar 8-character IDs first; fall back to a longer ID only
+        # after repeated collisions.
+        id_len = 8 if attempt < 20 else 12
+        order_id = uuid.uuid4().hex[:id_len].upper()
+        if await database.orders.find_one({"order_id": order_id}, {"_id": 1}):
+            continue
+        try:
+            await database.orders.insert_one({**order_doc_base, "order_id": order_id})
+            return order_id
+        except DuplicateKeyError:
+            continue
+
+    # Extremely unlikely fallback. Let the caller see a real failure instead of
+    # silently creating a duplicate or charging without an order.
+    raise RuntimeError("Could not generate a unique order ID after multiple attempts")
 
 
 async def get_order(order_id: str) -> Optional[dict]:
@@ -552,15 +645,31 @@ async def get_stuck_wallet_pending_orders(limit: int = 100) -> list[dict]:
 
 
 async def get_user_orders(user_id: int, limit: int = 20, skip: int = 0) -> list[dict]:
-    """Return the newest orders belonging to one user."""
+    """Return the newest purchase orders belonging to one user.
+
+    Replacement deliveries are shown separately in /replacements so normal
+    order history does not get mixed with replacement history.
+    """
     return await get_db().orders.find(
-        {"user_id": user_id}
+        {"user_id": user_id, "is_replacement": {"$ne": True}}
     ).sort("created_at", -1).skip(skip).limit(limit).to_list(length=limit)
 
 
 async def count_user_orders(user_id: int) -> int:
-    """Count all orders belonging to one user for pagination."""
-    return await get_db().orders.count_documents({"user_id": user_id})
+    """Count purchase orders belonging to one user for pagination."""
+    return await get_db().orders.count_documents({"user_id": user_id, "is_replacement": {"$ne": True}})
+
+
+async def get_user_replacement_orders(user_id: int, limit: int = 20, skip: int = 0) -> list[dict]:
+    """Return newest replacement deliveries belonging to one user."""
+    return await get_db().orders.find(
+        {"user_id": user_id, "is_replacement": True}
+    ).sort("created_at", -1).skip(skip).limit(limit).to_list(length=limit)
+
+
+async def count_user_replacement_orders(user_id: int) -> int:
+    """Count replacement deliveries belonging to one user for pagination."""
+    return await get_db().orders.count_documents({"user_id": user_id, "is_replacement": True})
 
 
 async def get_recent_orders(limit: int = 20, skip: int = 0) -> list[dict]:
@@ -1126,11 +1235,15 @@ async def confirm_pending_usdt_payment_if_waiting(ref_id: str, transaction: dict
             "usdt_transaction_source": str((transaction or {}).get("source") or ""),
         })
 
-    return await database.pending_payments.find_one_and_update(
-        {"ref_id": ref_id, "status": "waiting"},
-        {"$set": update},
-        return_document=ReturnDocument.AFTER,
-    )
+    try:
+        return await database.pending_payments.find_one_and_update(
+            {"ref_id": ref_id, "status": "waiting"},
+            {"$set": update},
+            return_document=ReturnDocument.AFTER,
+        )
+    except DuplicateKeyError:
+        # A concurrent verifier already used the same BEP20 transaction hash.
+        return None
 
 
 async def confirm_expired_usdt_payment(ref_id: str, transaction: dict | None = None) -> Optional[dict]:
@@ -1157,11 +1270,14 @@ async def confirm_expired_usdt_payment(ref_id: str, transaction: dict | None = N
             "usdt_match_type": str((transaction or {}).get("match_type") or ""),
             "usdt_transaction_source": str((transaction or {}).get("source") or ""),
         })
-    return await database.pending_payments.find_one_and_update(
-        {"ref_id": ref_id, "status": "expired"},
-        {"$set": update},
-        return_document=ReturnDocument.AFTER,
-    )
+    try:
+        return await database.pending_payments.find_one_and_update(
+            {"ref_id": ref_id, "status": "expired"},
+            {"$set": update},
+            return_document=ReturnDocument.AFTER,
+        )
+    except DuplicateKeyError:
+        return None
 
 
 async def confirm_pending_binance_payment_if_waiting(ref_id: str, transaction: dict) -> Optional[dict]:
@@ -1524,3 +1640,266 @@ async def get_used_usdt_transaction_hashes() -> set[str]:
 
 async def clear_pending(user_id: int):
     await get_db().pending_payments.delete_many({"user_id": user_id, "status": "waiting"})
+
+
+# ───────────────────── REPLACEMENT REPORTS ─────────────────────
+
+_REPORT_EMAIL_RE = re.compile(r"[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}", re.IGNORECASE)
+
+
+def stock_item_hash(item: str) -> str:
+    return hashlib.sha256(str(item or "").strip().encode("utf-8")).hexdigest()
+
+
+def _normalize_report_match_text(value: str) -> str:
+    text = str(value or "").strip().lower()
+    text = re.sub(r"\s+", " ", text)
+    return text
+
+
+def _emails_in_text(value: str) -> set[str]:
+    return {m.group(0).lower() for m in _REPORT_EMAIL_RE.finditer(str(value or ""))}
+
+
+def _significant_report_tokens(value: str) -> set[str]:
+    text = _normalize_report_match_text(value)
+    tokens = set(_emails_in_text(text))
+    # Account IDs / usernames / short IDs are often pasted without separators.
+    for token in re.findall(r"[a-z0-9._%+\-]{5,}", text, flags=re.IGNORECASE):
+        cleaned = token.strip("._-+% ").lower()
+        if len(cleaned) >= 5:
+            tokens.add(cleaned)
+    return tokens
+
+
+def _report_submitted_item_matches(submitted: str, delivered_item: str) -> bool:
+    submitted_norm = _normalize_report_match_text(submitted)
+    delivered_norm = _normalize_report_match_text(delivered_item)
+    if not submitted_norm or not delivered_norm:
+        return False
+
+    submitted_emails = _emails_in_text(submitted_norm)
+    delivered_emails = _emails_in_text(delivered_norm)
+    if submitted_emails and delivered_emails and submitted_emails.intersection(delivered_emails):
+        return True
+
+    # One pasted message can contain many emails/account IDs. Match any useful token
+    # from the delivered stock item instead of requiring the whole message to match.
+    submitted_tokens = _significant_report_tokens(submitted_norm)
+    delivered_tokens = _significant_report_tokens(delivered_norm)
+    if submitted_tokens and delivered_tokens and submitted_tokens.intersection(delivered_tokens):
+        return True
+
+    # Let users send only the email/account ID or a copied part of the stock text.
+    if len(submitted_norm) >= 6 and submitted_norm in delivered_norm:
+        return True
+    if len(delivered_norm) >= 6 and delivered_norm in submitted_norm:
+        return True
+    return submitted_norm == delivered_norm
+
+
+def _report_submitted_match_snippet(submitted: str, delivered_item: str) -> str:
+    """Return the exact submitted line/token that matched one delivered item.
+
+    This keeps multi-item reports readable in WebAdmin: each matched item shows
+    the user's relevant submitted account/email instead of repeating the whole
+    pasted message.
+    """
+    submitted_raw = str(submitted or "").strip()
+    delivered_raw = str(delivered_item or "").strip()
+    submitted_norm = _normalize_report_match_text(submitted_raw)
+    delivered_norm = _normalize_report_match_text(delivered_raw)
+    submitted_emails = _emails_in_text(submitted_norm)
+    delivered_emails = _emails_in_text(delivered_norm)
+    common_emails = submitted_emails.intersection(delivered_emails)
+    if common_emails:
+        email = sorted(common_emails, key=len, reverse=True)[0]
+        for line in submitted_raw.splitlines():
+            if email.lower() in line.lower():
+                return line.strip() or email
+        return email
+
+    submitted_tokens = _significant_report_tokens(submitted_norm)
+    delivered_tokens = _significant_report_tokens(delivered_norm)
+    common_tokens = submitted_tokens.intersection(delivered_tokens)
+    if common_tokens:
+        token = sorted(common_tokens, key=len, reverse=True)[0]
+        for line in submitted_raw.splitlines():
+            if token.lower() in line.lower():
+                return line.strip() or token
+        return token
+
+    for line in submitted_raw.splitlines():
+        clean_line = line.strip()
+        if clean_line and _report_submitted_item_matches(clean_line, delivered_raw):
+            return clean_line
+
+    return submitted_raw[:1000]
+
+
+async def _find_stock_owner_record_for_item(product_name: str, item: str) -> dict:
+    item_hash = stock_item_hash(item)
+    db = get_db()
+    product = await db.products.find_one({"name": _name_regex(product_name)}, {"name": 1, "stock_added_by": 1})
+    if product:
+        for record in product.get("stock_added_by", []) or []:
+            if isinstance(record, dict) and str(record.get("item_hash") or "") == item_hash:
+                result = dict(record)
+                result.setdefault("product_name", product.get("name") or product_name)
+                return result
+
+    cursor = db.products.find({"stock_added_by.item_hash": item_hash}, {"name": 1, "stock_added_by": 1})
+    async for product in cursor:
+        for record in product.get("stock_added_by", []) or []:
+            if isinstance(record, dict) and str(record.get("item_hash") or "") == item_hash:
+                result = dict(record)
+                result.setdefault("product_name", product.get("name") or product_name)
+                return result
+    return {"item_hash": item_hash}
+
+
+async def find_user_delivered_stock_items_for_report(user_id: int, submitted_text: str, limit: int = 20) -> list[dict]:
+    """Find delivered items belonging to this user from one pasted report message.
+
+    The user can paste one item, only an email/account ID, or multiple account
+    details in one message. Every delivered stock item that can be found inside
+    that message is returned. Active/replaced reports are marked so the bot can
+    skip duplicates while still allowing cancelled/rejected items to be reported
+    again.
+    """
+    matches: list[dict] = []
+    seen_hashes: set[str] = set()
+    cursor = get_db().orders.find(
+        {"user_id": int(user_id), "status": "delivered", "items.0": {"$exists": True}},
+        {"order_id": 1, "product_name": 1, "items": 1, "created_at": 1, "delivered_at": 1, "payment_method": 1},
+    ).sort("delivered_at", -1)
+    async for order in cursor:
+        for item in order.get("items", []) or []:
+            item_text = str(item or "").strip()
+            if not item_text:
+                continue
+            if not _report_submitted_item_matches(submitted_text, item_text):
+                continue
+            item_hash = stock_item_hash(item_text)
+            if item_hash in seen_hashes:
+                continue
+            seen_hashes.add(item_hash)
+            owner_record = await _find_stock_owner_record_for_item(str(order.get("product_name") or ""), item_text)
+            existing_report = await get_db().replacement_reports.find_one(
+                {
+                    "user_id": int(user_id),
+                    "$or": [{"item_hash": item_hash}, {"items.item_hash": item_hash}],
+                    "status": {"$nin": ["cancelled", "rejected", "closed"]},
+                },
+                {"report_id": 1, "status": 1, "created_at": 1},
+                sort=[("created_at", -1)],
+            )
+            matches.append({
+                "order_id": str(order.get("order_id") or ""),
+                "product_name": str(order.get("product_name") or ""),
+                "payment_method": str(order.get("payment_method") or ""),
+                "delivered_item": item_text,
+                "submitted_item": _report_submitted_match_snippet(submitted_text, item_text),
+                "item_hash": item_hash,
+                "already_reported": bool(existing_report),
+                "existing_report_id": str((existing_report or {}).get("report_id") or ""),
+                "existing_report_status": str((existing_report or {}).get("status") or ""),
+                "order_created_at": order.get("created_at"),
+                "sold_at": order.get("delivered_at") or order.get("created_at"),
+                "stock_added_by_username": str(owner_record.get("added_by_username") or ""),
+                "stock_added_by_role": str(owner_record.get("added_by_role") or ""),
+                "stock_added_at": owner_record.get("added_at"),
+                "stock_metadata_product_name": str(owner_record.get("product_name") or ""),
+            })
+            if len(matches) >= max(1, int(limit or 20)):
+                return matches
+    return matches
+
+
+async def find_user_delivered_stock_item_for_report(user_id: int, submitted_text: str) -> Optional[dict]:
+    """Find the newest matching delivered item belonging to this user."""
+    matches = await find_user_delivered_stock_items_for_report(user_id, submitted_text, limit=1)
+    return matches[0] if matches else None
+
+
+async def create_replacement_report(
+    *,
+    user_id: int,
+    username: str = "",
+    matched: dict | None = None,
+    matched_items: list[dict] | None = None,
+    issue_text: str,
+    screenshot_file_id: str = "",
+) -> str:
+    db = get_db()
+    now = datetime.now(timezone.utc)
+    clean_username = str(username or "").strip().lstrip("@")
+    matches = list(matched_items or [])
+    if not matches and matched:
+        matches = [matched]
+    matches = [m for m in matches if isinstance(m, dict)]
+    if not matches:
+        raise ValueError("create_replacement_report requires at least one matched item")
+
+    report_items: list[dict] = []
+    for m in matches:
+        report_items.append({
+            "order_id": str(m.get("order_id") or ""),
+            "product_name": str(m.get("product_name") or ""),
+            "payment_method": str(m.get("payment_method") or ""),
+            "submitted_item": str(m.get("submitted_item") or ""),
+            "delivered_item": str(m.get("delivered_item") or ""),
+            "item_hash": str(m.get("item_hash") or ""),
+            "sold_at": m.get("sold_at"),
+            "order_created_at": m.get("order_created_at"),
+            "stock_added_by_username": str(m.get("stock_added_by_username") or ""),
+            "stock_added_by_role": str(m.get("stock_added_by_role") or ""),
+            "stock_added_at": m.get("stock_added_at"),
+            "stock_metadata_product_name": str(m.get("stock_metadata_product_name") or ""),
+        })
+
+    first = report_items[0]
+    product_names: list[str] = []
+    order_ids: list[str] = []
+    for item in report_items:
+        product = str(item.get("product_name") or "")
+        order_id = str(item.get("order_id") or "")
+        if product and product not in product_names:
+            product_names.append(product)
+        if order_id and order_id not in order_ids:
+            order_ids.append(order_id)
+
+    for _ in range(20):
+        report_id = "REP" + uuid.uuid4().hex[:8].upper()
+        if not await db.replacement_reports.find_one({"report_id": report_id}, {"_id": 1}):
+            break
+    else:
+        report_id = "REP" + uuid.uuid4().hex[:12].upper()
+
+    doc = {
+        "report_id": report_id,
+        "user_id": int(user_id),
+        "username": clean_username,
+        "order_id": str(first.get("order_id") or ""),
+        "order_ids": order_ids,
+        "product_name": str(first.get("product_name") or ""),
+        "product_names": product_names,
+        "payment_method": str(first.get("payment_method") or ""),
+        "submitted_item": str(first.get("submitted_item") or ""),
+        "delivered_item": str(first.get("delivered_item") or ""),
+        "item_hash": str(first.get("item_hash") or ""),
+        "items": report_items,
+        "item_count": len(report_items),
+        "issue_text": str(issue_text or "").strip()[:2000],
+        "screenshot_file_id": str(screenshot_file_id or ""),
+        "status": "pending",
+        "created_at": now,
+        "sold_at": first.get("sold_at"),
+        "order_created_at": first.get("order_created_at"),
+        "stock_added_by_username": str(first.get("stock_added_by_username") or ""),
+        "stock_added_by_role": str(first.get("stock_added_by_role") or ""),
+        "stock_added_at": first.get("stock_added_at"),
+        "stock_metadata_product_name": str(first.get("stock_metadata_product_name") or ""),
+    }
+    await db.replacement_reports.insert_one(doc)
+    return report_id

@@ -33,9 +33,13 @@ def _payment_enabled(settings: dict, method: str) -> bool:
     return db.payment_method_enabled(settings, method)
 
 
-def clear_wallet_flow(user_id: int) -> None:
+def clear_wallet_flow(user_id: int | str | None) -> None:
     """Clears an active wallet top-up amount session for this user."""
-    _wallet_flow.pop(user_id, None)
+    try:
+        uid = int(user_id or 0)
+    except (TypeError, ValueError):
+        return
+    _wallet_flow.pop(uid, None)
 
 
 def _back_button(lang: str = "en") -> list[InlineKeyboardButton]:
@@ -75,7 +79,7 @@ async def _load_wallet_keyboard(lang: str = "en") -> tuple[InlineKeyboardMarkup,
     if _payment_enabled(settings, "binance"):
         rows.append([InlineKeyboardButton(tr(lang, "wallet_topup_binance"), callback_data="wallet_currency:binance_usdt")])
     has_methods = bool(rows)
-    rows.append(_back_button())
+    rows.append(_back_button(lang))
     return InlineKeyboardMarkup(rows), has_methods
 
 
@@ -124,7 +128,7 @@ async def cmd_load_wallet(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not user:
         await update.message.reply_text(tr(lang, "start_first"))
         return
-    await _send_load_wallet_options(update.message)
+    await _send_load_wallet_options(update.message, lang)
 
 
 
@@ -210,7 +214,7 @@ async def handle_wallet_currency_select(update: Update, context: ContextTypes.DE
     await query.edit_message_text(
         tr(lang, "topup_prompt", unit=unit, method_note=method_note, minimum=minimum),
         parse_mode="Markdown",
-        reply_markup=InlineKeyboardMarkup([_back_button()])
+        reply_markup=InlineKeyboardMarkup([_back_button(lang)])
     )
 
 async def handle_wallet_amount_input(update: Update, context: ContextTypes.DEFAULT_TYPE) -> bool:

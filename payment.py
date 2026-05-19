@@ -1033,6 +1033,8 @@ async def _send_pending_stock_notice(bot, user_id: int, order: dict, *, queued: 
 def _delivery_txt_filename(order: dict) -> str:
     order_id = str(order.get("order_id") or "order").strip() or "order"
     safe_order_id = "".join(ch for ch in order_id if ch.isalnum() or ch in ("-", "_")).strip() or "order"
+    if order.get("is_replacement"):
+        return f"replacement_{safe_order_id}_items.txt"
     return f"order_{safe_order_id}_items.txt"
 
 
@@ -1057,6 +1059,15 @@ def _delivery_caption(order: dict, *, from_pending: bool = False, lang: str = "e
     order_id = str(order.get("order_id") or "N/A")
     product_name = str(order.get("product_name") or "Product")
     quantity = int(order.get("quantity", 0) or 0)
+    if order.get("is_replacement"):
+        title = tr(lang, "replacement_resent_admin") if order.get("resent_by_admin") else tr(lang, "replacement_sent_admin")
+        return (
+            f"{title}\n\n"
+            f"🧾 {tr(lang, 'replacement_id')}: {order_id}\n"
+            f"🛠 {tr(lang, 'report_id')}: {order.get('replacement_report_id', 'N/A')}\n"
+            f"📦 {tr(lang, 'product')}: {product_name}\n"
+            f"🔢 {tr(lang, 'quantity')}: {quantity}"
+        )
     title = tr(lang, "pending_order_delivered") if from_pending else tr(lang, "order_placed_confirmed")
     if order.get("resent_by_admin"):
         title = tr(lang, "order_resent_admin")

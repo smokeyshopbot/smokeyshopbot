@@ -28,6 +28,12 @@ def method_label(method: str) -> str:
         return "UPI"
     if method == "binance":
         return "Binance Pay"
+    if method in {"admin", "admin_add", "admin_remove"}:
+        if method == "admin_add":
+            return "Admin wallet add"
+        if method == "admin_remove":
+            return "Admin wallet remove"
+        return "Admin wallet adjustment"
     return method.upper() if method else "N/A"
 
 
@@ -54,13 +60,15 @@ def amount_text(log: dict) -> str:
     load_amount = float(log.get("load_amount") or 0)
     expected_inr = float(log.get("expected_inr") or 0)
     expected_usdt = float(log.get("expected_usdt") or 0)
+    admin_action = (log.get("admin_wallet_action") or "").lower()
+    sign = "-" if admin_action == "remove" else "+" if admin_action == "add" else ""
 
     if currency == "inr" or method == "upi" or expected_inr > 0:
         amount = load_amount if load_amount > 0 else expected_inr
-        return f"₹{amount:.2f} INR"
+        return f"{sign}₹{amount:.2f} INR"
 
     amount = load_amount if load_amount > 0 else expected_usdt
-    return f"${amount:.2f} USDT"
+    return f"{sign}${amount:.2f} USDT"
 
 
 def format_wallet_history_text(
@@ -96,6 +104,8 @@ def format_wallet_history_text(
             f"{tr(lang, 'amount')}: {amount_text(log)}",
             f"{tr(lang, 'status')}: {status_label(log.get('status'), lang)}",
         ])
+        if log.get("admin_wallet_adjustment") and log.get("notes"):
+            lines.append(f"Note: {log.get('notes')}")
         lines.append("")
 
     return compact_blank_lines("\n".join(lines))

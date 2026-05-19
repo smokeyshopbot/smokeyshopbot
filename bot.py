@@ -26,22 +26,25 @@ import database as db
 from utils.i18n import tr
 
 from handlers.user import (
-    cmd_start, cmd_commands, cmd_support, cmd_shop, cmd_favorites, cmd_language, cmd_orders as cmd_user_orders_command,
+    cmd_start, cmd_commands, cmd_support, cmd_shop, cmd_favorites, cmd_language, cmd_orders as cmd_user_orders_command, cmd_replacements,
     handle_nav_buttons, handle_language_select, handle_product_select, handle_get_order_lookup,
-    handle_payment_method_select, handle_quantity_input, handle_favorite_button,
+    handle_payment_method_select, handle_quantity_input, handle_favorite_button, clear_shop_flow,
 )
 from handlers.payment import (
     handle_check_usdt, handle_upi_paid_button, handle_upi_text_input, handle_upi_screenshot,
     handle_check_binance, handle_binance_paid_button, handle_binance_text_input, handle_binance_screenshot,
     handle_usdt_manual_button, handle_usdt_manual_input, handle_usdt_manual_screenshot,
-    is_payment_manual_input_active,
+    is_payment_manual_input_active, clear_payment_manual_flows,
     resume_pending_usdt_payments, resume_pending_payment_notices, start_usdt_global_watcher,
     resume_pending_binance_payments, start_binance_global_watcher,
     recover_stuck_wallet_orders, start_stale_unpaid_expiry_watcher,
 )
 from handlers.wallet import (
     cmd_wallet, cmd_load_wallet, cmd_wallet_history,
-    handle_wallet_currency_select, handle_wallet_amount_input, handle_wallet_history_page,
+    handle_wallet_currency_select, handle_wallet_amount_input, handle_wallet_history_page, clear_wallet_flow,
+)
+from handlers.replacements import (
+    cmd_report, handle_report_text, handle_report_photo, handle_report_callbacks, is_report_flow_active, clear_report_flow,
 )
 
 logging.basicConfig(
@@ -111,9 +114,53 @@ async def maintenance_guard(update: Update, context: ContextTypes.DEFAULT_TYPE):
     raise ApplicationHandlerStop
 
 
+def _clear_user_input_flows(user_id: int | str | None, *, include_payment_manual: bool = True) -> None:
+    """Clear active one-user input sessions when a new command takes over.
+
+    Text messages inside a flow still work normally. Only a new bot command or
+    a new navigation callback cancels the previous waiting-for-input state.
+    Pending payment records are not cancelled; only temporary manual-proof input
+    state is cleared.
+    """
+    clear_report_flow(user_id)
+    clear_shop_flow(user_id)
+    clear_wallet_flow(user_id)
+    if include_payment_manual:
+        clear_payment_manual_flows(user_id)
+
+
+async def clear_input_flows_on_new_command_or_navigation(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Cancel the previous waiting flow when the user starts another command.
+
+    This prevents cases like starting /report, then opening /shop, where the
+    next quantity message could otherwise be consumed by the old report flow.
+    Normal non-command messages inside the active flow are still accepted.
+    """
+    user = update.effective_user
+    if not user:
+        return
+
+    if update.message and update.message.text and update.message.text.strip().startswith("/"):
+        _clear_user_input_flows(user.id, include_payment_manual=True)
+        return
+
+    if update.callback_query:
+        data = str(update.callback_query.data or "")
+        if data.startswith("report:"):
+            return
+        # Navigation/product/wallet buttons start a new user flow, so cancel a
+        # half-finished report. Do not clear shop flow for payment buttons.
+        if data.startswith(("nav:", "product:", "product_id:", "favorite_buy:", "favorite_buy_id:", "wallet_currency:")):
+            clear_report_flow(user.id)
+
+
 async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     if await db.is_blocked(user_id):
+        return
+
+    # Replacement/report flow
+    if await handle_report_text(update, context):
         return
 
     # USDT manual txn hash
@@ -137,10 +184,62 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
 
+async def _field_has_duplicates(collection, field_name: str, *, non_empty_string_only: bool = True) -> bool:
+    """Return True when creating a unique index would fail due duplicates.
+
+    This check never modifies data. It is used before converting an older
+    non-unique index into a unique one.
+    """
+    match = {field_name: {"$exists": True}}
+    if non_empty_string_only:
+        match[field_name].update({"$type": "string", "$gt": ""})
+    rows = await collection.aggregate([
+        {"$match": match},
+        {"$group": {"_id": f"${field_name}", "count": {"$sum": 1}}},
+        {"$match": {"count": {"$gt": 1}}},
+        {"$limit": 1},
+    ]).to_list(length=1)
+    return bool(rows)
+
+
+async def _ensure_unique_index_safely(collection, keys, *, name: str, duplicate_field: str, partial_filter: dict | None = None):
+    """Create/upgrade a unique index only when it is safe for existing data.
+
+    If duplicates already exist, no rows are deleted or changed; startup logs a
+    warning and keeps the old index so the bot can continue running.
+    """
+    duplicate_check_non_empty = duplicate_field != "order_id"
+    if await _field_has_duplicates(collection, duplicate_field, non_empty_string_only=duplicate_check_non_empty):
+        logger.warning(
+            "⚠️ Unique index %s was not created because duplicate %s values already exist. Clean duplicates first.",
+            name, duplicate_field,
+        )
+        return
+
+    keys_list = list(keys) if isinstance(keys, (list, tuple)) else [(keys, 1)]
+    try:
+        index_info = await collection.index_information()
+        for existing_name, spec in index_info.items():
+            if list(spec.get("key", [])) == keys_list:
+                if spec.get("unique"):
+                    return
+                # Drop only the old non-unique index definition, never data.
+                await collection.drop_index(existing_name)
+                break
+        options = {"unique": True, "name": name}
+        if partial_filter:
+            options["partialFilterExpression"] = partial_filter
+        await collection.create_index(keys_list, **options)
+    except Exception as exc:
+        logger.warning("⚠️ Could not ensure unique index %s (non-fatal): %s", name, exc)
+
+
 async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Routes photo messages for manual payment screenshots."""
     user_id = update.effective_user.id
     if await db.is_blocked(user_id):
+        return
+    if await handle_report_photo(update, context):
         return
     if await handle_upi_screenshot(update, context):
         return
@@ -159,11 +258,26 @@ async def post_init(application):
         await db_conn.pending_payments.create_index([("status", 1), ("created_at", 1)])
         await db_conn.pending_payments.create_index([("pay_type", 1), ("user_id", 1), ("created_at", -1)])
         await db_conn.pending_payments.create_index("binance_transaction_id", unique=True, sparse=True)
-        await db_conn.orders.create_index("order_id")
+        await _ensure_unique_index_safely(
+            db_conn.pending_payments,
+            [("usdt_transaction_hash", 1)],
+            name="uniq_usdt_transaction_hash_nonempty",
+            duplicate_field="usdt_transaction_hash",
+            partial_filter={"usdt_transaction_hash": {"$type": "string", "$gt": ""}},
+        )
+        await _ensure_unique_index_safely(
+            db_conn.orders,
+            [("order_id", 1)],
+            name="uniq_order_id",
+            duplicate_field="order_id",
+        )
         await db_conn.orders.create_index([("product_name", 1), ("status", 1), ("created_at", 1)])
         await db_conn.orders.create_index([("status", 1), ("user_id", 1)])
         await db_conn.products.create_index([("name", 1), ("enabled", 1)])
         await db_conn.settings.create_index("key", unique=True)
+        await db_conn.replacement_reports.create_index("report_id", unique=True)
+        await db_conn.replacement_reports.create_index([("status", 1), ("created_at", -1)])
+        await db_conn.replacement_reports.create_index([("user_id", 1), ("created_at", -1)])
         logger.info("✅ Database indexes ensured.")
     except Exception as e:
         logger.warning(f"⚠️ Could not create DB indexes (non-fatal): {e}")
@@ -214,6 +328,10 @@ def main():
         .build()
     )
 
+    # ── Cancel stale input flows when users start another command/menu action ──
+    app.add_handler(MessageHandler(filters.COMMAND, clear_input_flows_on_new_command_or_navigation), group=-2)
+    app.add_handler(CallbackQueryHandler(clear_input_flows_on_new_command_or_navigation), group=-2)
+
     # ── Maintenance guard: runs before normal handlers ──
     app.add_handler(MessageHandler(filters.ALL, maintenance_guard), group=-1)
     app.add_handler(CallbackQueryHandler(maintenance_guard), group=-1)
@@ -227,7 +345,9 @@ def main():
     app.add_handler(CommandHandler("loadwallet", cmd_load_wallet))
     app.add_handler(CommandHandler("wallethistory", cmd_wallet_history))
     app.add_handler(CommandHandler("orders", cmd_user_orders_command))
+    app.add_handler(CommandHandler("replacements", cmd_replacements))
     app.add_handler(CommandHandler("favorites", cmd_favorites))
+    app.add_handler(CommandHandler("report", cmd_report))
     app.add_handler(CommandHandler("language", cmd_language))
 
     # ── User inline button callbacks ──
@@ -243,6 +363,7 @@ def main():
     app.add_handler(CallbackQueryHandler(handle_binance_paid_button, pattern=r"^binance_paid:"))
     app.add_handler(CallbackQueryHandler(handle_wallet_currency_select, pattern=r"^wallet_currency:"))
     app.add_handler(CallbackQueryHandler(handle_wallet_history_page, pattern=r"^wallethistory:"))
+    app.add_handler(CallbackQueryHandler(handle_report_callbacks, pattern=r"^report:"))
 
     # ── Message handlers ──
     app.add_handler(MessageHandler(filters.TEXT & filters.Regex(r"^/(getorder|getid)"), handle_get_order_lookup))
