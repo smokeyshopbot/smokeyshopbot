@@ -60,7 +60,7 @@ def amount_text(log: dict) -> str:
         return f"₹{amount:.2f} INR"
 
     amount = load_amount if load_amount > 0 else expected_usdt
-    return f"${amount:.6f} USDT"
+    return f"${amount:.2f} USDT"
 
 
 def format_wallet_history_text(
