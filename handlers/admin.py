@@ -109,10 +109,52 @@ async def _notify_active_users(bot, text: str, *, product_name: str, parse_mode:
     return sent
 
 
+async def flush_maintenance_notifications(bot) -> dict[str, int]:
+    """Send queued product/stock/price notifications after maintenance is OFF."""
+    rows = await db.get_maintenance_notifications(limit=500)
+    sent = 0
+    processed = 0
+    for row in rows:
+        payload = row.get("payload") if isinstance(row.get("payload"), dict) else {}
+        kind = str(row.get("kind") or "")
+        product_name = str(row.get("product_name") or "").strip()
+        try:
+            if kind == "new_product":
+                product = await db.get_product(product_name)
+                sent += await notify_users_new_product(bot, product or payload or {"name": product_name})
+            elif kind == "new_stock":
+                sent += await notify_users_new_stock(bot, product_name, payload.get("available_stock"))
+            elif kind == "price_drop":
+                product = await db.get_product(product_name)
+                if product:
+                    sent += await notify_users_price_drop(
+                        bot,
+                        product,
+                        old_inr=payload.get("old_inr"),
+                        new_inr=payload.get("new_inr"),
+                        old_usdt=payload.get("old_usdt"),
+                        new_usdt=payload.get("new_usdt"),
+                    )
+            processed += 1
+        finally:
+            await db.delete_maintenance_notification(row.get("_id"))
+    return {"processed": processed, "sent": sent}
+
+
 async def notify_users_new_product(bot, product: dict) -> int:
     if not product or product.get("enabled", True) is False:
         return 0
     product_name = str(product.get("name") or "Product")
+    if await db.is_maintenance_mode():
+        await db.queue_maintenance_notification(
+            "new_product",
+            product_name,
+            {
+                "price_inr": product.get("price_inr"),
+                "price_usdt": product.get("price_usdt"),
+            },
+        )
+        return 0
     product_label = html.escape(product_name, quote=False)
     lines = []
     try:
@@ -139,6 +181,13 @@ async def notify_users_new_stock(bot, product_name: str, available_stock: int | 
     product = await db.get_product(product_name)
     if not product or product.get("enabled", True) is False:
         return 0
+    if await db.is_maintenance_mode():
+        await db.queue_maintenance_notification(
+            "new_stock",
+            str(product.get("name") or product_name),
+            {"available_stock": available_stock},
+        )
+        return 0
     if available_stock is None:
         available_stock = await db.get_available_stock_count(product.get("name", product_name))
     try:
@@ -160,6 +209,14 @@ async def notify_users_new_stock(bot, product_name: str, available_stock: int | 
 async def notify_users_price_drop(bot, product: dict, *, old_inr=None, new_inr=None, old_usdt=None, new_usdt=None) -> int:
     if not product or product.get("enabled", True) is False:
         return 0
+    product_name = str(product.get("name") or "Product")
+    if await db.is_maintenance_mode():
+        await db.queue_maintenance_notification(
+            "price_drop",
+            product_name,
+            {"old_inr": old_inr, "new_inr": new_inr, "old_usdt": old_usdt, "new_usdt": new_usdt},
+        )
+        return 0
     settings = await db.get_payment_settings()
     lines = []
     try:
@@ -174,7 +231,6 @@ async def notify_users_price_drop(bot, product: dict, *, old_inr=None, new_inr=N
         pass
     if not lines:
         return 0
-    product_name = str(product.get("name") or "Product")
     product_label = html.escape(product_name, quote=False)
     text = (
         "🔻 <b>Price Dropped!</b>\n\n"
@@ -1207,7 +1263,12 @@ async def cmd_maintenance(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     if arg in {"off", "disable", "disabled", "false", "0"}:
         await db.set_maintenance_mode(False)
-        await update.message.reply_text("✅ Maintenance mode is now OFF. Users can use the bot normally.")
+        flushed = await flush_maintenance_notifications(context.bot)
+        await update.message.reply_text(
+            "✅ Maintenance mode is now OFF. Users can use the bot normally.\n"
+            f"📨 Delivered queued product/stock/price notification events: {flushed['processed']} "
+            f"(messages sent: {flushed['sent']})."
+        )
         return
     if arg == "status":
         enabled = await db.is_maintenance_mode()
@@ -1254,6 +1315,9 @@ async def cmd_unblock_user(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 @admin_only
 async def cmd_broadcast(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if await db.is_maintenance_mode():
+        await update.message.reply_text("🛠 Maintenance mode is ON. Broadcast skipped and not queued.")
+        return
     if not context.args:
         await update.message.reply_text("Usage: `/broadcast <your message>`", parse_mode="Markdown")
         return

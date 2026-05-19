@@ -123,6 +123,14 @@ _binance_global_watcher_task: asyncio.Task | None = None
 _usdt_manual: dict[int, dict] = {}
 
 
+def is_payment_manual_input_active(user_id: int | str | None) -> bool:
+    """True when a user is in the middle of a manual payment proof flow."""
+    try:
+        uid = int(user_id or 0)
+    except (TypeError, ValueError):
+        return False
+    return uid in _upi_collection or uid in _binance_collection or uid in _usdt_manual
+
 
 def _details_from_pending(pending: dict | None) -> dict:
     details = (pending or {}).get("payment_details") or {}
@@ -1443,6 +1451,8 @@ async def _payment_notice_worker(context_or_application, ref_id: str):
 
 
 async def _send_payment_reminder(bot, pending: dict):
+    if await db.is_maintenance_mode():
+        return
     user_id = int(pending.get("user_id", 0) or 0)
     if not user_id:
         return
@@ -1502,6 +1512,9 @@ async def _expire_payment_session(bot, ref_id: str):
             f"{tr(lang, 'order_id')}: `{ref_id}`\n"
             f"{tr(lang, 'order_expired_body', minutes=PAYMENT_TIMEOUT_MINUTES)}"
         )
+
+    if await db.is_maintenance_mode():
+        return
 
     try:
         await bot.send_message(user_id, text, parse_mode="Markdown")

@@ -34,6 +34,7 @@ from handlers.payment import (
     handle_check_usdt, handle_upi_paid_button, handle_upi_text_input, handle_upi_screenshot,
     handle_check_binance, handle_binance_paid_button, handle_binance_text_input, handle_binance_screenshot,
     handle_usdt_manual_button, handle_usdt_manual_input, handle_usdt_manual_screenshot,
+    is_payment_manual_input_active,
     resume_pending_usdt_payments, resume_pending_payment_notices, start_usdt_global_watcher,
     resume_pending_binance_payments, start_binance_global_watcher,
     recover_stuck_wallet_orders, start_stale_unpaid_expiry_watcher,
@@ -50,12 +51,51 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 
+PAYMENT_ALLOWED_DURING_MAINTENANCE_PREFIXES = (
+    "check_usdt:",
+    "check_binance:",
+    "usdt_manual:",
+    "upi_paid:",
+    "binance_paid:",
+)
+
+
+async def is_maintenance_exempt_user(user_id: int | str | None) -> bool:
+    if is_admin_id(user_id):
+        return True
+    try:
+        uid = int(user_id or 0)
+    except (TypeError, ValueError):
+        return False
+    try:
+        settings = await db.get_secret_settings()
+        raw = str(settings.get("admin_ids") or "")
+        admin_ids = {int(part.strip()) for part in raw.split(",") if part.strip()}
+        return uid in admin_ids
+    except Exception:
+        return False
+
+
 async def maintenance_guard(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Stops user updates while maintenance mode is ON."""
+    """Stop normal user updates while maintenance mode is ON.
+
+    Exceptions:
+    - Telegram admin/tester IDs configured in WebAdmin Secret Settings.
+    - Existing payment/check/manual-proof flow, so users who already paid can
+      still verify payment and receive their completed order/wallet result.
+    """
     user = update.effective_user
-    if not user or is_admin_id(user.id):
+    if not user or await is_maintenance_exempt_user(user.id):
         return
     if not await db.is_maintenance_mode():
+        return
+
+    if update.callback_query:
+        data = str(update.callback_query.data or "")
+        if data.startswith(PAYMENT_ALLOWED_DURING_MAINTENANCE_PREFIXES):
+            return
+
+    if update.message and is_payment_manual_input_active(user.id):
         return
 
     lang = await db.get_user_language(user.id)

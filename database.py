@@ -966,7 +966,47 @@ async def set_maintenance_mode(enabled: bool):
 async def is_maintenance_mode() -> bool:
     return bool(await get_setting("maintenance_mode", False))
 
+# ─────────────────────── MAINTENANCE NOTIFICATION QUEUE ────────────────────
 
+async def queue_maintenance_notification(kind: str, product_name: str, payload: dict | None = None):
+    """Queue product/stock/price notifications created while maintenance is ON.
+
+    Broadcasts are intentionally not queued. Queued product notifications are
+    flushed when maintenance mode is turned OFF. One queued row is kept per
+    notification kind + product, so repeated edits during maintenance collapse
+    into the latest notification instead of spamming users later.
+    """
+    kind = str(kind or "").strip()
+    product_name = str(product_name or "").strip()
+    if not kind or not product_name:
+        return
+    now = datetime.now(timezone.utc)
+    await get_db().maintenance_notifications.update_one(
+        {"kind": kind, "product_name": product_name},
+        {
+            "$set": {
+                "kind": kind,
+                "product_name": product_name,
+                "payload": payload or {},
+                "updated_at": now,
+            },
+            "$setOnInsert": {"created_at": now},
+        },
+        upsert=True,
+    )
+
+
+async def get_maintenance_notifications(limit: int = 100) -> list[dict]:
+    cursor = get_db().maintenance_notifications.find({}).sort("created_at", 1).limit(max(1, int(limit or 100)))
+    return await cursor.to_list(length=max(1, int(limit or 100)))
+
+
+async def delete_maintenance_notification(notification_id):
+    await get_db().maintenance_notifications.delete_one({"_id": notification_id})
+
+
+async def count_maintenance_notifications() -> int:
+    return await get_db().maintenance_notifications.count_documents({})
 
 
 # ─────────────────────── PENDING PAYMENTS ────────────────────

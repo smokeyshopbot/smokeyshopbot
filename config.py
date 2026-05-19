@@ -83,13 +83,28 @@ def _secret_int(key: str, default: int) -> int:
 # Telegram
 BOT_TOKEN: str = _secret_required("bot_token", "Telegram bot token")
 
-# Telegram admin panel has been removed. WebAdmin is the only admin panel.
-ADMIN_IDS: list[int] = []
-ADMIN_ID: int = 0
+# Telegram admin panel commands are removed, but these IDs are allowed to use
+# the bot while maintenance mode is ON for testing. Configure in WebAdmin →
+# Secret Settings → Telegram admin/tester IDs, or fallback to ADMIN_IDS in .env.
+def _parse_admin_ids(value: str) -> list[int]:
+    ids: list[int] = []
+    for part in _split_csv(value):
+        try:
+            ids.append(int(part))
+        except (TypeError, ValueError):
+            continue
+    return ids
+
+
+ADMIN_IDS: list[int] = _parse_admin_ids(_secret_str("admin_ids", os.getenv("ADMIN_IDS", "")))
+ADMIN_ID: int = ADMIN_IDS[0] if ADMIN_IDS else 0
 
 
 def is_admin_id(user_id: int | str | None) -> bool:
-    return False
+    try:
+        return int(user_id or 0) in ADMIN_IDS
+    except (TypeError, ValueError):
+        return False
 
 
 # USDT BEP20 verification providers. Managed in WebAdmin → Secret Settings.
