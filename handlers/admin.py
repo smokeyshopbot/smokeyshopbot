@@ -89,8 +89,39 @@ def _product_notify_markup(product: dict | None, product_name: str) -> InlineKey
     return InlineKeyboardMarkup([[InlineKeyboardButton("🛒 Buy Now", callback_data=callback_data)]])
 
 
-async def _notify_active_users(bot, text: str, *, product_name: str, parse_mode: str = "HTML") -> int:
+def _parse_admin_id_csv(raw: str) -> set[int]:
+    ids: set[int] = set()
+    for part in str(raw or "").split(","):
+        try:
+            uid = int(part.strip())
+        except (TypeError, ValueError):
+            continue
+        if uid:
+            ids.add(uid)
+    return ids
+
+
+async def _get_admin_id_set() -> set[int]:
+    ids = {int(uid) for uid in ADMIN_IDS if uid}
+    try:
+        settings = await db.get_secret_settings()
+        ids.update(_parse_admin_id_csv(str(settings.get("admin_ids") or "")))
+    except Exception:
+        pass
+    return ids
+
+
+async def _notify_active_users(
+    bot,
+    text: str,
+    *,
+    product_name: str,
+    parse_mode: str = "HTML",
+    admin_only: bool = False,
+    include_admins: bool = True,
+) -> int:
     users = await db.get_all_users()
+    admin_ids = await _get_admin_id_set()
     sent = 0
     product = await db.get_product(product_name)
     markup = _product_notify_markup(product, product_name)
@@ -100,6 +131,11 @@ async def _notify_active_users(bot, text: str, *, product_name: str, parse_mode:
         except Exception:
             user_id = 0
         if not user_id:
+            continue
+        is_admin_target = user_id in admin_ids
+        if admin_only and not is_admin_target:
+            continue
+        if not include_admins and is_admin_target:
             continue
         try:
             await bot.send_message(user_id, text, parse_mode=parse_mode, reply_markup=markup)
@@ -121,9 +157,9 @@ async def flush_maintenance_notifications(bot) -> dict[str, int]:
         try:
             if kind == "new_product":
                 product = await db.get_product(product_name)
-                sent += await notify_users_new_product(bot, product or payload or {"name": product_name})
+                sent += await notify_users_new_product(bot, product or payload or {"name": product_name}, include_admins=False)
             elif kind == "new_stock":
-                sent += await notify_users_new_stock(bot, product_name, payload.get("available_stock"))
+                sent += await notify_users_new_stock(bot, product_name, payload.get("available_stock"), include_admins=False)
             elif kind == "price_drop":
                 product = await db.get_product(product_name)
                 if product:
@@ -134,6 +170,7 @@ async def flush_maintenance_notifications(bot) -> dict[str, int]:
                         new_inr=payload.get("new_inr"),
                         old_usdt=payload.get("old_usdt"),
                         new_usdt=payload.get("new_usdt"),
+                        include_admins=False,
                     )
             processed += 1
         finally:
@@ -141,20 +178,7 @@ async def flush_maintenance_notifications(bot) -> dict[str, int]:
     return {"processed": processed, "sent": sent}
 
 
-async def notify_users_new_product(bot, product: dict) -> int:
-    if not product or product.get("enabled", True) is False:
-        return 0
-    product_name = str(product.get("name") or "Product")
-    if await db.is_maintenance_mode():
-        await db.queue_maintenance_notification(
-            "new_product",
-            product_name,
-            {
-                "price_inr": product.get("price_inr"),
-                "price_usdt": product.get("price_usdt"),
-            },
-        )
-        return 0
+async def _new_product_notification_text(product: dict, product_name: str) -> str:
     product_label = html.escape(product_name, quote=False)
     lines = []
     try:
@@ -168,25 +192,37 @@ async def notify_users_new_product(bot, product: dict) -> int:
     except Exception:
         pass
     price_lines = "\n".join(html.escape(line, quote=False) for line in lines)
-    text = (
+    return (
         "🆕 <b>New Product Added!</b>\n\n"
         f"<b>{product_label}</b> is available now.\n"
         f"{price_lines}\n\n"
         "Tap below to buy."
     )
-    return await _notify_active_users(bot, text, product_name=product_name)
 
 
-async def notify_users_new_stock(bot, product_name: str, available_stock: int | None = None) -> int:
-    product = await db.get_product(product_name)
+async def notify_users_new_product(bot, product: dict, *, include_admins: bool = True) -> int:
     if not product or product.get("enabled", True) is False:
         return 0
+    product_name = str(product.get("name") or "Product")
+    text = await _new_product_notification_text(product, product_name)
     if await db.is_maintenance_mode():
         await db.queue_maintenance_notification(
-            "new_stock",
-            str(product.get("name") or product_name),
-            {"available_stock": available_stock},
+            "new_product",
+            product_name,
+            {
+                "price_inr": product.get("price_inr"),
+                "price_usdt": product.get("price_usdt"),
+            },
         )
+        # During maintenance, admin/tester IDs receive the notification now for testing.
+        # Normal users receive the queued product notification only after maintenance is OFF.
+        return await _notify_active_users(bot, text, product_name=product_name, admin_only=True)
+    return await _notify_active_users(bot, text, product_name=product_name, include_admins=include_admins)
+
+
+async def notify_users_new_stock(bot, product_name: str, available_stock: int | None = None, *, include_admins: bool = True) -> int:
+    product = await db.get_product(product_name)
+    if not product or product.get("enabled", True) is False:
         return 0
     if available_stock is None:
         available_stock = await db.get_available_stock_count(product.get("name", product_name))
@@ -196,27 +232,24 @@ async def notify_users_new_stock(bot, product_name: str, available_stock: int | 
         available_stock = 0
     if available_stock <= 0:
         return 0
-    product_label = html.escape(str(product.get("name") or product_name), quote=False)
+    clean_name = str(product.get("name") or product_name)
+    product_label = html.escape(clean_name, quote=False)
     text = (
         "📦 <b>Fresh Stock Added!</b>\n\n"
         f"<b>{product_label}</b> is available now.\n"
         f"🛒 Available stock: <b>{available_stock}</b>\n\n"
         "Tap below to buy."
     )
-    return await _notify_active_users(bot, text, product_name=str(product.get("name") or product_name))
+    if await db.is_maintenance_mode():
+        await db.queue_maintenance_notification("new_stock", clean_name, {"available_stock": available_stock})
+        return await _notify_active_users(bot, text, product_name=clean_name, admin_only=True)
+    return await _notify_active_users(bot, text, product_name=clean_name, include_admins=include_admins)
 
 
-async def notify_users_price_drop(bot, product: dict, *, old_inr=None, new_inr=None, old_usdt=None, new_usdt=None) -> int:
+async def notify_users_price_drop(bot, product: dict, *, old_inr=None, new_inr=None, old_usdt=None, new_usdt=None, include_admins: bool = True) -> int:
     if not product or product.get("enabled", True) is False:
         return 0
     product_name = str(product.get("name") or "Product")
-    if await db.is_maintenance_mode():
-        await db.queue_maintenance_notification(
-            "price_drop",
-            product_name,
-            {"old_inr": old_inr, "new_inr": new_inr, "old_usdt": old_usdt, "new_usdt": new_usdt},
-        )
-        return 0
     settings = await db.get_payment_settings()
     lines = []
     try:
@@ -238,8 +271,14 @@ async def notify_users_price_drop(bot, product: dict, *, old_inr=None, new_inr=N
         + "\n".join(f"💰 {html.escape(line, quote=False)}" for line in lines)
         + "\n\nTap below to buy."
     )
-    return await _notify_active_users(bot, text, product_name=product_name)
-
+    if await db.is_maintenance_mode():
+        await db.queue_maintenance_notification(
+            "price_drop",
+            product_name,
+            {"old_inr": old_inr, "new_inr": new_inr, "old_usdt": old_usdt, "new_usdt": new_usdt},
+        )
+        return await _notify_active_users(bot, text, product_name=product_name, admin_only=True)
+    return await _notify_active_users(bot, text, product_name=product_name, include_admins=include_admins)
 
 def is_admin(user_id: int) -> bool:
     return is_admin_id(user_id)
@@ -1315,28 +1354,55 @@ async def cmd_unblock_user(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 @admin_only
 async def cmd_broadcast(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if await db.is_maintenance_mode():
-        await update.message.reply_text("🛠 Maintenance mode is ON. Broadcast skipped and not queued.")
-        return
     if not context.args:
         await update.message.reply_text("Usage: `/broadcast <your message>`", parse_mode="Markdown")
         return
     message = " ".join(context.args)
     users = await db.get_all_users()
+    admin_ids = await _get_admin_id_set()
+    maintenance_on = await db.is_maintenance_mode()
     sent = 0
     failed = 0
+    seen: set[int] = set()
+
     for user in users:
-        if int(user["user_id"]) in ADMIN_IDS:
+        try:
+            user_id = int(user.get("user_id", 0) or 0)
+        except Exception:
+            user_id = 0
+        if not user_id or user_id in seen:
             continue
+        if maintenance_on and user_id not in admin_ids:
+            continue
+        seen.add(user_id)
         try:
             await context.bot.send_message(
-                user["user_id"],
+                user_id,
                 f"📢 *Broadcast Message:*\n\n{message}",
                 parse_mode="Markdown"
             )
             sent += 1
         except Exception:
             failed += 1
+
+    if maintenance_on:
+        # Admin/tester IDs should receive test broadcasts during maintenance even
+        # if their user row is not in the users collection. Normal users are not queued.
+        for user_id in sorted(admin_ids - seen):
+            try:
+                await context.bot.send_message(
+                    user_id,
+                    f"📢 *Broadcast Message:*\n\n{message}",
+                    parse_mode="Markdown"
+                )
+                sent += 1
+            except Exception:
+                failed += 1
+        await update.message.reply_text(
+            f"🛠 Maintenance mode is ON. Broadcast sent only to admin/tester IDs and not queued for normal users.\n✅ Sent: {sent}\n❌ Failed: {failed}"
+        )
+        return
+
     await update.message.reply_text(
         f"📢 Broadcast complete!\n✅ Sent: {sent}\n❌ Failed: {failed}"
     )
