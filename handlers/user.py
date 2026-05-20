@@ -83,7 +83,7 @@ def _price_usdt_label(value) -> str:
 
 
 def _price_label(product: dict, settings: dict, *, quantity: int = 1, lang: str = "en") -> str:
-    """Show only enabled product prices. Exact payment pages still use 6 decimals."""
+    """Show only enabled product prices. Crypto payment pages show only the unique 3-decimal send amount."""
     parts = []
     if _payment_enabled(settings, "upi"):
         parts.append(_price_inr_label(float(product.get('price_inr') or 0) * quantity))

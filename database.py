@@ -16,6 +16,7 @@ import time
 import uuid
 from datetime import datetime, timezone, timedelta
 from typing import Optional
+from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
 
 from motor.motor_asyncio import AsyncIOMotorClient
 from pymongo import ReturnDocument
@@ -1217,6 +1218,17 @@ async def count_maintenance_notifications() -> int:
 
 # ─────────────────────── PENDING PAYMENTS ────────────────────
 
+
+def _normalize_new_unique_usdt(value: float) -> float:
+    """Store new generated payment amounts at 3 decimals while keeping display simple."""
+    try:
+        amount = Decimal(str(value or 0))
+    except (InvalidOperation, TypeError, ValueError):
+        return 0.0
+    if amount <= 0:
+        return 0.0
+    return float(amount.quantize(Decimal("0.001"), rounding=ROUND_HALF_UP))
+
 async def create_pending_payment(
     user_id: int,
     ref_id: str,          # order_id or "wallet_<uuid>"
@@ -1228,6 +1240,7 @@ async def create_pending_payment(
     currency: str = "",   # For wallet top-ups: "inr" or "usdt"
     load_amount: float = 0.0,
 ) -> dict:
+    unique_usdt = _normalize_new_unique_usdt(unique_usdt)
     doc = {
         "user_id": user_id,
         "ref_id": ref_id,
@@ -1296,9 +1309,47 @@ async def confirm_pending_payment_if_waiting(ref_id: str) -> Optional[dict]:
     )
 
 
+def normalize_usdt_tx_hash(txn_hash: str | None) -> str:
+    """Normalize BEP20 tx hashes for duplicate checks.
+
+    BSC transaction hashes are hexadecimal and should be treated
+    case-insensitively. Keep only surrounding whitespace removed.
+    """
+    return str(txn_hash or "").strip().lower()
+
+
 def _usdt_tx_hash_from_transaction(transaction: dict | None) -> str:
     tx = transaction or {}
-    return str(tx.get("hash") or tx.get("txhash") or tx.get("transactionHash") or "").strip()
+    return normalize_usdt_tx_hash(tx.get("hash") or tx.get("txhash") or tx.get("transactionHash") or "")
+
+
+def _usdt_tx_hash_exact_query(txn_hash: str) -> dict:
+    normalized = normalize_usdt_tx_hash(txn_hash)
+    if not normalized:
+        return {"$expr": {"$eq": [1, 0]}}
+    escaped = re.escape(normalized)
+    return {
+        "$or": [
+            {"usdt_transaction_hash": {"$regex": f"^{escaped}$", "$options": "i"}},
+            {"usdt_txn_hash": {"$regex": f"^{escaped}$", "$options": "i"}},
+        ]
+    }
+
+
+async def find_used_usdt_tx_hash(txn_hash: str | None, exclude_ref_id: str | None = None) -> Optional[dict]:
+    """Return a payment row already using this BEP20 tx hash/ID.
+
+    Checks both auto-verification hashes (usdt_transaction_hash) and manual
+    proof hashes (usdt_txn_hash), so one transaction cannot be reused between
+    auto and manual flows.
+    """
+    normalized = normalize_usdt_tx_hash(txn_hash)
+    if not normalized:
+        return None
+    query = _usdt_tx_hash_exact_query(normalized)
+    if exclude_ref_id:
+        query = {"$and": [query, {"ref_id": {"$ne": exclude_ref_id}}]}
+    return await get_db().pending_payments.find_one(query)
 
 
 async def confirm_pending_usdt_payment_if_waiting(ref_id: str, transaction: dict | None = None) -> Optional[dict]:
@@ -1316,10 +1367,7 @@ async def confirm_pending_usdt_payment_if_waiting(ref_id: str, transaction: dict
     }
 
     if tx_hash:
-        duplicate = await database.pending_payments.find_one({
-            "usdt_transaction_hash": tx_hash,
-            "ref_id": {"$ne": ref_id},
-        })
+        duplicate = await find_used_usdt_tx_hash(tx_hash, exclude_ref_id=ref_id)
         if duplicate:
             return None
         update.update({
@@ -1352,10 +1400,7 @@ async def confirm_expired_usdt_payment(ref_id: str, transaction: dict | None = N
         "confirmed_at": datetime.now(timezone.utc),
     }
     if tx_hash:
-        duplicate = await database.pending_payments.find_one({
-            "usdt_transaction_hash": tx_hash,
-            "ref_id": {"$ne": ref_id},
-        })
+        duplicate = await find_used_usdt_tx_hash(tx_hash, exclude_ref_id=ref_id)
         if duplicate:
             return None
         update.update({
@@ -1506,14 +1551,24 @@ async def clear_pending_payment_message(ref_id: str):
     )
 
 
-async def set_usdt_manual_details(ref_id: str, txn_hash: str, screenshot_file_id: str | None = None):
-    update = {"usdt_txn_hash": txn_hash, "status": "usdt_manual_submitted"}
+async def set_usdt_manual_details(ref_id: str, txn_hash: str, screenshot_file_id: str | None = None) -> bool:
+    normalized_hash = normalize_usdt_tx_hash(txn_hash)
+    if not normalized_hash:
+        return False
+    duplicate = await find_used_usdt_tx_hash(normalized_hash, exclude_ref_id=ref_id)
+    if duplicate:
+        return False
+    update = {"usdt_txn_hash": normalized_hash, "status": "usdt_manual_submitted"}
     if screenshot_file_id:
         update["usdt_screenshot_file_id"] = screenshot_file_id
-    await get_db().pending_payments.update_one(
-        {"ref_id": ref_id},
-        {"$set": update},
-    )
+    try:
+        result = await get_db().pending_payments.update_one(
+            {"ref_id": ref_id, "status": "waiting"},
+            {"$set": update},
+        )
+    except DuplicateKeyError:
+        return False
+    return bool(result.modified_count or result.matched_count)
 
 
 async def set_upi_details(ref_id: str, payee_name: str, txn_id: str, screenshot_file_id: str | None = None):
@@ -1729,10 +1784,21 @@ async def get_used_binance_transaction_ids() -> set[str]:
 
 async def get_used_usdt_transaction_hashes() -> set[str]:
     rows = await get_db().pending_payments.find(
-        {"usdt_transaction_hash": {"$exists": True, "$ne": ""}},
-        {"usdt_transaction_hash": 1},
+        {
+            "$or": [
+                {"usdt_transaction_hash": {"$exists": True, "$ne": ""}},
+                {"usdt_txn_hash": {"$exists": True, "$ne": ""}},
+            ]
+        },
+        {"usdt_transaction_hash": 1, "usdt_txn_hash": 1},
     ).to_list(length=None)
-    return {str(row.get("usdt_transaction_hash") or "").strip() for row in rows if row.get("usdt_transaction_hash")}
+    hashes: set[str] = set()
+    for row in rows:
+        for key in ("usdt_transaction_hash", "usdt_txn_hash"):
+            value = normalize_usdt_tx_hash(row.get(key))
+            if value:
+                hashes.add(value)
+    return hashes
 
 
 async def clear_pending(user_id: int):

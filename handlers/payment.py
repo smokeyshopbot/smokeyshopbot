@@ -45,6 +45,23 @@ def _decimal_usdt(value) -> Decimal | None:
         return None
 
 
+def _format_payment_usdt(value) -> str:
+    """Format the user-facing crypto payment amount with exactly 3 decimals."""
+    try:
+        amount = Decimal(str(value or 0))
+    except (InvalidOperation, TypeError, ValueError):
+        amount = Decimal("0")
+    return f"{amount.quantize(USDT_PAYMENT_QUANT):.3f}"
+
+
+def _format_wallet_usdt_display(value) -> str:
+    """Format wallet balances/top-up credits with normal 2-decimal money display."""
+    try:
+        return f"{float(value or 0):.2f}"
+    except (TypeError, ValueError):
+        return "0.00"
+
+
 def _raw_decimal_usdt(value) -> Decimal | None:
     try:
         return Decimal(str(value))
@@ -354,6 +371,7 @@ async def initiate_usdt_payment(
 
     usdt_wallet = str(settings["usdt_bep20"].get("wallet_address") or "").strip()
     await db.set_pending_payment_config(ref_id, {"usdt_wallet_address": usdt_wallet, "language": lang})
+    display_unique_usdt = _format_payment_usdt(unique_usdt)
 
     wallet_id_line = await _wallet_load_id_line(ref_id, lang)
     text_template = (
@@ -361,7 +379,7 @@ async def initiate_usdt_payment(
         f"📋 {description}\n"
         f"{wallet_id_line}\n"
         f"{tr(lang, 'send_this_amount')}\n"
-        f"```\n{unique_usdt:.3f} USDT\n```\n"
+        f"```\n{display_unique_usdt} USDT\n```\n"
         f"{tr(lang, 'to_this_wallet')}\n"
         f"`{usdt_wallet}`\n\n"
         f"{tr(lang, 'usdt_exact_warning')}\n"
@@ -564,13 +582,18 @@ async def handle_usdt_manual_input(update: Update, context: ContextTypes.DEFAULT
         await update.message.reply_text(tr(lang, "send_usdt_screenshot_photo"), parse_mode="Markdown")
         return True
 
-    txn_hash = update.message.text.strip()
+    txn_hash = db.normalize_usdt_tx_hash(update.message.text)
     ref_id = state["ref_id"]
 
     pending = await db.get_pending_by_ref(ref_id)
     if not pending or pending["status"] != "waiting":
         _usdt_manual.pop(user_id, None)
         await update.message.reply_text(tr(lang, "session_no_longer_active"))
+        return True
+
+    if await db.find_used_usdt_tx_hash(txn_hash, exclude_ref_id=ref_id):
+        _usdt_manual[user_id]["step"] = "txn_hash"
+        await update.message.reply_text(tr(lang, "usdt_tx_hash_already_used"), parse_mode="Markdown")
         return True
 
     _usdt_manual[user_id]["txn_hash"] = txn_hash
@@ -600,7 +623,11 @@ async def handle_usdt_manual_screenshot(update: Update, context: ContextTypes.DE
         await update.message.reply_text(tr(lang, "session_no_longer_active"))
         return True
 
-    await db.set_usdt_manual_details(ref_id, txn_hash, photo.file_id)
+    if not await db.set_usdt_manual_details(ref_id, txn_hash, photo.file_id):
+        _usdt_manual[user_id] = {"step": "txn_hash", "ref_id": ref_id, "language": lang}
+        await update.message.reply_text(tr(lang, "usdt_tx_hash_already_used"), parse_mode="Markdown")
+        return True
+
     await update.message.reply_text(tr(lang, "manual_usdt_submitted"), parse_mode="Markdown")
     logger.info("Manual USDT proof %s saved for WebAdmin review.", ref_id)
     return True
@@ -805,10 +832,11 @@ async def initiate_binance_payment(
 
     binance_pay_id = str(settings["binance"].get("binance_pay_id") or "").strip()
     binance_pay_name = str(settings["binance"].get("binance_pay_name") or "Merchant").strip() or "Merchant"
+    display_amount_usdt = _format_payment_usdt(amount_usdt)
     await db.set_pending_payment_config(ref_id, {
         "binance_pay_id": binance_pay_id,
         "binance_pay_name": binance_pay_name,
-        "binance_unique_usdt": f"{float(amount_usdt):.3f}",
+        "binance_unique_usdt": display_amount_usdt,
         "language": lang,
     })
 
@@ -818,7 +846,7 @@ async def initiate_binance_payment(
         f"📋 {description}\n"
         f"{wallet_id_line}\n"
         f"{tr(lang, 'send_exact_amount')}\n"
-        f"```\n{amount_usdt:.3f} USDT\n```\n"
+        f"```\n{display_amount_usdt} USDT\n```\n"
         f"{tr(lang, 'binance_pay_id', pay_id=binance_pay_id)}\n"
         f"{tr(lang, 'binance_name', name=binance_pay_name)}\n\n"
         f"{tr(lang, 'binance_steps', pay_id=binance_pay_id)}\n\n"
@@ -1338,7 +1366,7 @@ async def _send_wallet_load_status(bot, user_id: int, pending: dict, *, already:
         bal = float(user.get("wallet_usdt", 0.0) or 0.0)
         await bot.send_message(
             user_id,
-            f"{title}\n\n{tr(lang, 'wallet_added_usdt', amount=f'{load_amount:.2f}')}\n{tr(lang, 'wallet_current_usdt', balance=f'{bal:.2f}')}\n\n{tr(lang, 'wallet_use_wallet')}",
+            f"{title}\n\n{tr(lang, 'wallet_added_usdt', amount=_format_wallet_usdt_display(load_amount))}\n{tr(lang, 'wallet_current_usdt', balance=_format_wallet_usdt_display(bal))}\n\n{tr(lang, 'wallet_use_wallet')}",
             parse_mode="Markdown"
         )
 
