@@ -56,7 +56,8 @@ LOOKBACK_SECONDS = int(USDT_LOOKBACK_SECONDS or 3600)
 USDT_DECIMALS = Decimal("1000000000000000000")
 RPC_BLOCK_CHUNK_SIZE = max(10, int(BSC_RPC_BLOCK_CHUNK_SIZE or 450))
 REQUIRED_CONFIRMATIONS = max(1, int(BEP20_REQUIRED_CONFIRMATIONS or 3))
-USDT_QUANT = Decimal("0.000001")
+USDT_QUANT = Decimal("0.001")
+USDT_LEGACY_QUANT = Decimal("0.000001")
 
 
 @dataclass
@@ -386,9 +387,16 @@ def _match_api_transfer(transfers: list[dict], expected: Decimal, lookback: int,
 
 def _to_decimal(value: float | str | Decimal) -> Decimal | None:
     try:
-        return Decimal(str(value)).quantize(Decimal("0.000001"))
+        return Decimal(str(value))
     except (InvalidOperation, ValueError):
         return None
+
+
+def _expected_decimal(expected: Decimal) -> Decimal:
+    """Use 3 decimals for new payments, but preserve old 6-decimal pending amounts."""
+    if expected == expected.quantize(USDT_QUANT):
+        return expected.quantize(USDT_QUANT)
+    return expected.quantize(USDT_LEGACY_QUANT)
 
 
 def _raw_token_value_to_decimal(raw_value: str) -> Decimal | None:
@@ -417,19 +425,19 @@ def _api_tx_has_required_confirmations(tx: dict) -> bool:
 
 
 def _amount_match_details(actual: Decimal, expected: Decimal) -> dict | None:
-    """Return match metadata only when the USDT amount exactly matches."""
+    """Return match metadata only when the actual USDT amount exactly matches."""
     try:
-        actual_q = actual.quantize(USDT_QUANT)
-        expected_q = expected.quantize(USDT_QUANT)
-        diff = abs(actual_q - expected_q).quantize(USDT_QUANT)
+        expected_q = _expected_decimal(expected)
+        # Do not quantize the actual transaction amount before comparing.
+        # This keeps auto-verification exact while payment pages show 3 decimals.
+        if actual != expected_q:
+            return None
+        diff = abs(actual - expected_q).quantize(USDT_LEGACY_QUANT)
     except Exception:
         return None
 
-    if actual_q != expected_q:
-        return None
-
     return {
-        "actual": actual_q,
+        "actual": actual,
         "expected": expected_q,
         "difference": diff,
         "type": "exact",

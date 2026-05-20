@@ -190,7 +190,7 @@ async def add_wallet_inr(user_id: int, amount: float):
 
 async def add_wallet_usdt(user_id: int, amount: float):
     await get_db().users.update_one(
-        {"user_id": user_id}, {"$inc": {"wallet_usdt": round(amount, 6)}}
+        {"user_id": user_id}, {"$inc": {"wallet_usdt": round(amount, 2)}}
     )
 
 
@@ -531,14 +531,19 @@ async def claim_restock_notification_slot(
     current_available_stock: int,
     *,
     cooldown_minutes: int = 60,
+    long_cooldown_minutes: int = 360,
+    high_stock_threshold: int = 20,
     default_threshold: int = 10,
 ) -> bool:
-    """Return True once when stock recovers from low to healthy.
+    """Return True when a safe fresh-stock notification may be sent.
 
-    The recovery trigger uses available stock, not raw stock, so paid
-    pending-stock orders are fulfilled first and users are notified only when
-    stock is actually available for new buyers. A per-product cooldown prevents
-    notification spam when stock repeatedly moves around the threshold.
+    Normal rule: notify when available stock recovers from below the product's
+    low-stock threshold to the threshold or higher, using the normal cooldown.
+
+    Long reminder rule: after the long cooldown, any real stock addition can
+    trigger the same fresh-stock notification as long as stock is now available.
+    This also covers products that already have healthy/high stock. Updating the
+    same per-product timestamp prevents a second notification immediately after.
     """
     product = await get_db().products.find_one(
         {"name": _name_regex(product_name)},
@@ -551,16 +556,37 @@ async def claim_restock_notification_slot(
         current_available_stock = int(current_available_stock or 0)
     except Exception:
         return False
+    if current_available_stock <= 0:
+        return False
+
     threshold = get_product_restock_threshold(product, default_threshold)
-    if previous_available_stock >= threshold or current_available_stock < threshold:
+    low_stock_recovered = previous_available_stock < threshold <= current_available_stock
+
+    try:
+        high_threshold = max(1, int(high_stock_threshold or 20))
+    except Exception:
+        high_threshold = 20
+    high_stock_reminder = current_available_stock > high_threshold
+    any_stock_after_long_cooldown = current_available_stock > 0
+    long_reminder_allowed = high_stock_reminder or any_stock_after_long_cooldown
+
+    if not low_stock_recovered and not long_reminder_allowed:
         return False
 
     try:
-        cooldown = max(1, int(cooldown_minutes or 60))
+        normal_cooldown = max(1, int(cooldown_minutes or 60))
     except Exception:
-        cooldown = 60
+        normal_cooldown = 60
+    try:
+        long_cooldown = max(normal_cooldown, int(long_cooldown_minutes or 360))
+    except Exception:
+        long_cooldown = max(normal_cooldown, 360)
+
+    # Low-stock recovery is allowed after the shorter normal cooldown. Other
+    # additions/reminders must wait for the longer cooldown.
+    required_cooldown = normal_cooldown if low_stock_recovered else long_cooldown
     now = datetime.now(timezone.utc)
-    cutoff = now - timedelta(minutes=cooldown)
+    cutoff = now - timedelta(minutes=required_cooldown)
     result = await get_db().products.update_one(
         {
             "_id": product["_id"],

@@ -30,12 +30,24 @@ from utils.binance_pay import (
 
 logger = logging.getLogger(__name__)
 
-USDT_PAYMENT_QUANT = Decimal("0.000001")
+USDT_PAYMENT_QUANT = Decimal("0.001")
+USDT_LEGACY_PAYMENT_QUANT = Decimal("0.000001")
 
 
 def _decimal_usdt(value) -> Decimal | None:
+    """Normalize expected USDT amounts while keeping old 6-decimal pending rows valid."""
     try:
-        return Decimal(str(value)).quantize(USDT_PAYMENT_QUANT)
+        amount = Decimal(str(value))
+        if amount == amount.quantize(USDT_PAYMENT_QUANT):
+            return amount.quantize(USDT_PAYMENT_QUANT)
+        return amount.quantize(USDT_LEGACY_PAYMENT_QUANT)
+    except (InvalidOperation, TypeError, ValueError):
+        return None
+
+
+def _raw_decimal_usdt(value) -> Decimal | None:
+    try:
+        return Decimal(str(value))
     except (InvalidOperation, TypeError, ValueError):
         return None
 
@@ -43,14 +55,14 @@ def _decimal_usdt(value) -> Decimal | None:
 def _tx_actual_usdt(transaction: dict | None) -> Decimal | None:
     tx = transaction or {}
     for key in ("match_actual_usdt", "value_usdt", "amount"):
-        amount = _decimal_usdt(tx.get(key))
+        amount = _raw_decimal_usdt(tx.get(key))
         if amount is not None:
             return amount
     try:
         raw_value = tx.get("value")
         token_decimal = int(tx.get("tokenDecimal", "18") or 18)
         if raw_value is not None:
-            return (Decimal(str(raw_value)) / (Decimal(10) ** token_decimal)).quantize(USDT_PAYMENT_QUANT)
+            return Decimal(str(raw_value)) / (Decimal(10) ** token_decimal)
     except Exception:
         return None
     return None
@@ -349,7 +361,7 @@ async def initiate_usdt_payment(
         f"📋 {description}\n"
         f"{wallet_id_line}\n"
         f"{tr(lang, 'send_this_amount')}\n"
-        f"```\n{unique_usdt:.6f} USDT\n```\n"
+        f"```\n{unique_usdt:.3f} USDT\n```\n"
         f"{tr(lang, 'to_this_wallet')}\n"
         f"`{usdt_wallet}`\n\n"
         f"{tr(lang, 'usdt_exact_warning')}\n"
@@ -796,7 +808,7 @@ async def initiate_binance_payment(
     await db.set_pending_payment_config(ref_id, {
         "binance_pay_id": binance_pay_id,
         "binance_pay_name": binance_pay_name,
-        "binance_unique_usdt": f"{float(amount_usdt):.6f}",
+        "binance_unique_usdt": f"{float(amount_usdt):.3f}",
         "language": lang,
     })
 
@@ -806,7 +818,7 @@ async def initiate_binance_payment(
         f"📋 {description}\n"
         f"{wallet_id_line}\n"
         f"{tr(lang, 'send_exact_amount')}\n"
-        f"```\n{amount_usdt:.6f} USDT\n```\n"
+        f"```\n{amount_usdt:.3f} USDT\n```\n"
         f"{tr(lang, 'binance_pay_id', pay_id=binance_pay_id)}\n"
         f"{tr(lang, 'binance_name', name=binance_pay_name)}\n\n"
         f"{tr(lang, 'binance_steps', pay_id=binance_pay_id)}\n\n"
@@ -1326,7 +1338,7 @@ async def _send_wallet_load_status(bot, user_id: int, pending: dict, *, already:
         bal = float(user.get("wallet_usdt", 0.0) or 0.0)
         await bot.send_message(
             user_id,
-            f"{title}\n\n{tr(lang, 'wallet_added_usdt', amount=f'{load_amount:.4f}')}\n{tr(lang, 'wallet_current_usdt', balance=f'{bal:.4f}')}\n\n{tr(lang, 'wallet_use_wallet')}",
+            f"{title}\n\n{tr(lang, 'wallet_added_usdt', amount=f'{load_amount:.2f}')}\n{tr(lang, 'wallet_current_usdt', balance=f'{bal:.2f}')}\n\n{tr(lang, 'wallet_use_wallet')}",
             parse_mode="Markdown"
         )
 

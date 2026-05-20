@@ -15,7 +15,7 @@ import hmac
 import logging
 import time
 from dataclasses import dataclass
-from decimal import Decimal, InvalidOperation, ROUND_DOWN
+from decimal import Decimal, InvalidOperation
 from typing import Any
 from urllib.parse import urlencode
 
@@ -31,7 +31,8 @@ from config import (
 
 logger = logging.getLogger(__name__)
 
-USDT_QUANT = Decimal("0.000001")
+USDT_QUANT = Decimal("0.001")
+USDT_LEGACY_QUANT = Decimal("0.000001")
 _SERVER_TIME_OFFSET_MS: int | None = None
 _SERVER_TIME_OFFSET_EXPIRES_AT = 0.0
 
@@ -70,25 +71,31 @@ class _RuntimeBinanceConfig:
 
 def _amount_key(value: Any) -> Decimal | None:
     try:
-        return Decimal(str(value)).quantize(USDT_QUANT, rounding=ROUND_DOWN)
+        return Decimal(str(value))
     except (InvalidOperation, TypeError, ValueError):
         return None
 
 
+def _expected_amount_key(expected: Decimal) -> Decimal:
+    """Use 3 decimals for new payments, but preserve old 6-decimal pending amounts."""
+    if expected == expected.quantize(USDT_QUANT):
+        return expected.quantize(USDT_QUANT)
+    return expected.quantize(USDT_LEGACY_QUANT)
+
+
 def _amount_match_details(actual: Decimal, expected: Decimal) -> dict | None:
-    """Return match metadata only when the USDT amount exactly matches."""
+    """Return match metadata only when the actual USDT amount exactly matches."""
     try:
-        actual_q = actual.quantize(USDT_QUANT)
-        expected_q = expected.quantize(USDT_QUANT)
-        diff = abs(actual_q - expected_q).quantize(USDT_QUANT)
+        expected_q = _expected_amount_key(expected)
+        # Do not round/truncate the actual Binance Pay transaction amount.
+        if actual != expected_q:
+            return None
+        diff = abs(actual - expected_q).quantize(USDT_LEGACY_QUANT)
     except Exception:
         return None
 
-    if actual_q != expected_q:
-        return None
-
     return {
-        "actual": actual_q,
+        "actual": actual,
         "expected": expected_q,
         "difference": diff,
         "type": "exact",

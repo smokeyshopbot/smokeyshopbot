@@ -277,7 +277,7 @@ USDT_MANUAL_VERIFY_DELAY_MINUTES=5
 BEP20_REQUIRED_CONFIRMATIONS=3
 ```
 
-1. Bot generates a tiny unique amount (e.g. `15.000041 USDT`) specific to this order
+1. Bot generates a 3-decimal unique amount (e.g. `15.253 USDT`) specific to this order
 2. User sends the exact amount to your BEP20 wallet
 3. Bot polls automatically and the user can press **🔄 Check Payment**
 4. Auto-check uses explorer APIs first, then BSC RPC `eth_getLogs` fallbacks in small chunks
@@ -295,7 +295,7 @@ BEP20_REQUIRED_CONFIRMATIONS=3
 6. On rejection: user is notified ❌
 
 ### Binance Pay (Auto + Manual Fallback)
-1. Bot generates a unique Binance Pay USDT amount, e.g. `15.000041 USDT`
+1. Bot generates a unique Binance Pay USDT amount, e.g. `15.253 USDT`
 2. User sends the exact amount to your Binance Pay ID/name
 3. Bot polls Binance Pay trade history automatically and the user can press **🔄 Check Payment**
 4. If detected, the order is delivered or the wallet is credited automatically

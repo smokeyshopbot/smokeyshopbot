@@ -43,7 +43,14 @@ from utils.wallet_history import (
 )
 
 import database as db
-from config import ADMIN_IDS, LOW_STOCK_ALERT_THRESHOLD, RESTOCK_NOTIFICATION_COOLDOWN_MINUTES, is_admin_id
+from config import (
+    ADMIN_IDS,
+    LOW_STOCK_ALERT_THRESHOLD,
+    RESTOCK_HIGH_STOCK_THRESHOLD,
+    RESTOCK_LONG_NOTIFICATION_COOLDOWN_MINUTES,
+    RESTOCK_NOTIFICATION_COOLDOWN_MINUTES,
+    is_admin_id,
+)
 
 # Track admins waiting to add stock: { user_id: product_name }
 _awaiting_stock: dict[int, str] = {}
@@ -664,7 +671,7 @@ def _format_users_page(users: list[dict], page: int, total_pages: int, total_cou
             f"Username: {username}",
             f"Status: {status}",
             f"INR Wallet: ₹{float(u.get('wallet_inr') or 0):.2f}",
-            f"USDT Wallet: ${float(u.get('wallet_usdt') or 0):.6f}",
+            f"USDT Wallet: ${float(u.get('wallet_usdt') or 0):.2f}",
             "",
         ])
     return compact_blank_lines("\n".join(lines))
@@ -802,13 +809,13 @@ async def cmd_add_balance(update: Update, context: ContextTypes.DEFAULT_TYPE):
         amount_text = f"₹{amount:.2f}"
         balance_text = f"₹{new_balance:.2f}"
     else:
-        amount = round(amount, 6)
+        amount = round(amount, 2)
         await db.add_wallet_usdt(target_user_id, amount)
         updated = await db.get_user(target_user_id)
         new_balance = float(updated.get("wallet_usdt", 0)) if updated else amount
         currency_label = "USDT"
-        amount_text = f"${amount:.6f} USDT"
-        balance_text = f"${new_balance:.6f} USDT"
+        amount_text = f"${amount:.2f} USDT"
+        balance_text = f"${new_balance:.2f} USDT"
 
     admin_lines = [
         "✅ Wallet balance added successfully.",
@@ -913,19 +920,19 @@ async def cmd_remove_balance(update: Update, context: ContextTypes.DEFAULT_TYPE)
         amount_text = f"₹{amount:.2f}"
         balance_text = f"₹{new_balance:.2f}"
     else:
-        amount = round(amount, 6)
+        amount = round(amount, 2)
         current_balance = float(user.get("wallet_usdt", 0) or 0)
         if current_balance < amount:
             await update.message.reply_text(
-                f"❌ Cannot remove ${amount:.6f} USDT. User only has ${current_balance:.6f} USDT."
+                f"❌ Cannot remove ${amount:.2f} USDT. User only has ${current_balance:.2f} USDT."
             )
             return
         success = await db.deduct_wallet_usdt(target_user_id, amount)
         updated = await db.get_user(target_user_id)
         new_balance = float(updated.get("wallet_usdt", 0)) if updated else max(0, current_balance - amount)
         currency_label = "USDT"
-        amount_text = f"${amount:.6f} USDT"
-        balance_text = f"${new_balance:.6f} USDT"
+        amount_text = f"${amount:.2f} USDT"
+        balance_text = f"${new_balance:.2f} USDT"
 
     if not success:
         await update.message.reply_text(
@@ -1010,7 +1017,7 @@ async def cmd_stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"❌ Failed/expired: *{stats['orders_failed']}*\n\n"
         f"💰 Revenue/paid value:\n"
         f"₹{stats['revenue_inr']:.2f} INR\n"
-        f"${stats['revenue_usdt']:.6f} USDT"
+        f"${stats['revenue_usdt']:.2f} USDT"
     )
     await update.message.reply_text(text, parse_mode="Markdown")
 
@@ -1038,7 +1045,7 @@ async def cmd_user_stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"Status: {'🚫 Blocked' if user.get('blocked') else '✅ Active'}\n"
         f"Joined: {_format_dt(user.get('joined_at'))}\n"
         f"Wallet INR: ₹{float(user.get('wallet_inr') or 0):.2f}\n"
-        f"Wallet USDT: ${float(user.get('wallet_usdt') or 0):.6f}\n\n"
+        f"Wallet USDT: ${float(user.get('wallet_usdt') or 0):.2f}\n\n"
         f"Orders: *{stats['total_orders']}*\n"
         f"✅ Delivered: *{stats['delivered']}*\n"
         f"⏳ Waiting stock: *{stats['pending_stock']}*\n"
@@ -1580,6 +1587,8 @@ async def handle_stock_input(update: Update, context: ContextTypes.DEFAULT_TYPE)
             previous_available,
             available,
             cooldown_minutes=RESTOCK_NOTIFICATION_COOLDOWN_MINUTES,
+            long_cooldown_minutes=RESTOCK_LONG_NOTIFICATION_COOLDOWN_MINUTES,
+            high_stock_threshold=RESTOCK_HIGH_STOCK_THRESHOLD,
             default_threshold=LOW_STOCK_ALERT_THRESHOLD,
         )
     )
@@ -1717,8 +1726,8 @@ async def send_usdt_manual_approval_request(
         f"🔍 *Manual USDT Verification Request*\n\n"
         f"👤 User ID: `{pending['user_id']}`\n"
         f"📝 Ref: `{ref_id}`\n"
-        f"💰 Expected Amount: ${pending['expected_usdt']:.6f} USDT\n"
-        f"💰 Unique Amount: ${pending.get('unique_usdt', pending['expected_usdt']):.6f} USDT\n"
+        f"💰 Expected Amount: ${pending['expected_usdt']:.2f} USDT\n"
+        f"💰 Unique Amount: ${pending.get('unique_usdt', pending['expected_usdt']):.3f} USDT\n"
         f"📋 {order_or_wallet_info}\n\n"
         f"🔗 TxHash: `{txn_hash}`\n\n"
         f"Verify on BSCScan:\n"
@@ -1808,7 +1817,7 @@ async def send_binance_approval_request(
         f"🟡 *Binance Pay Verification Request*\n\n"
         f"👤 User ID: `{pending['user_id']}`\n"
         f"📝 Ref: `{ref_id}`\n"
-        f"💰 Amount: ${pending['expected_usdt']:.4f} USDT\n"
+        f"💰 Amount: ${pending['expected_usdt']:.2f} USDT\n"
         f"📋 {order_or_wallet_info}\n\n"
         f"👤 Binance Name: `{pending.get('binance_name', 'N/A')}`"
     )

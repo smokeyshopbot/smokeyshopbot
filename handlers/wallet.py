@@ -49,7 +49,7 @@ def _back_button(lang: str = "en") -> list[InlineKeyboardButton]:
 def _fmt_amount(value: float, currency: str) -> str:
     if currency == "inr":
         return f"₹{value:.2f}"
-    return f"${value:.4f}".rstrip("0").rstrip(".")
+    return f"${value:.2f}"
 
 
 def _wallet_min_amount(settings: dict, currency: str) -> float:
@@ -264,7 +264,7 @@ async def handle_wallet_amount_input(update: Update, context: ContextTypes.DEFAU
         )
 
     elif currency == "binance_usdt":
-        amount_usdt = round(amount, 4)
+        amount_usdt = round(amount, 2)
         unique_usdt = await generate_unique_usdt_amount(amount_usdt)
         await db.create_pending_payment(
             user_id=user_id, ref_id=ref_id, pay_type="wallet",
@@ -275,11 +275,11 @@ async def handle_wallet_amount_input(update: Update, context: ContextTypes.DEFAU
         await initiate_binance_payment(
             update, context, user_id, ref_id,
             amount_usdt=unique_usdt,
-            description=f"{tr(lang, 'wallet_topup_id')} `{ref_id}` | ${amount_usdt:.4f} USDT"
+            description=f"{tr(lang, 'wallet_topup_id')} `{ref_id}` | ${amount_usdt:.2f} USDT"
         )
 
     else:  # usdt via BEP20
-        amount_usdt = round(amount, 4)
+        amount_usdt = round(amount, 2)
         unique_usdt = await generate_unique_usdt_amount(amount_usdt)
         await db.create_pending_payment(
             user_id=user_id, ref_id=ref_id, pay_type="wallet",
@@ -290,7 +290,7 @@ async def handle_wallet_amount_input(update: Update, context: ContextTypes.DEFAU
         await initiate_usdt_payment(
             update, context, user_id, ref_id,
             amount_inr=0, unique_usdt=unique_usdt,
-            description=f"{tr(lang, 'wallet_topup_id')} `{ref_id}` | ${amount_usdt:.4f} USDT"
+            description=f"{tr(lang, 'wallet_topup_id')} `{ref_id}` | ${amount_usdt:.2f} USDT"
         )
 
     return True
