@@ -12,6 +12,11 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import logging
 import hashlib
 import socket
+import atexit
+import os as _os
+import threading
+import uuid
+from datetime import datetime, timezone, timedelta
 from telegram import Update
 from telegram.ext import (
     ApplicationBuilder,
@@ -23,7 +28,11 @@ from telegram.ext import (
     ApplicationHandlerStop,
 )
 
-from config import BOT_TOKEN, is_admin_id
+from telegram.error import Conflict
+from pymongo import MongoClient, ReturnDocument
+from pymongo.errors import DuplicateKeyError, PyMongoError
+
+from config import BOT_TOKEN, is_admin_id, MONGO_URI, DB_NAME
 import database as db
 from utils.i18n import tr
 
@@ -57,21 +66,30 @@ logger = logging.getLogger(__name__)
 
 
 _POLLING_SINGLETON_SOCKET: socket.socket | None = None
+_POLLING_LOCK_CLIENT: MongoClient | None = None
+_POLLING_LOCK_OWNER: str | None = None
+_POLLING_LOCK_KEY: str | None = None
+_POLLING_LOCK_STOP = threading.Event()
+_POLLING_LOCK_THREAD: threading.Thread | None = None
+_POLLING_LOCK_TTL_SECONDS = 180
+_POLLING_LOCK_HEARTBEAT_SECONDS = 30
+
+
+def _token_hash() -> str:
+    return hashlib.sha256(str(BOT_TOKEN).encode("utf-8")).hexdigest()
+
+
+def _now_utc() -> datetime:
+    return datetime.now(timezone.utc)
 
 
 def _acquire_local_polling_singleton() -> None:
-    """Prevent accidental double polling in the same server/container.
-
-    Telegram only allows one active getUpdates poller per bot token. This local
-    guard catches the common deployment mistake where the same service starts
-    bot.py twice on the same machine. It does not replace the Telegram-side
-    protection, but it exits with a clearer message before polling starts.
-    """
+    """Prevent accidental double polling in the same server/container."""
     global _POLLING_SINGLETON_SOCKET
     if _POLLING_SINGLETON_SOCKET is not None:
         return
 
-    token_hash = hashlib.sha256(str(BOT_TOKEN).encode("utf-8")).hexdigest()
+    token_hash = _token_hash()
     port = 20000 + (int(token_hash[:8], 16) % 20000)
     sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     try:
@@ -84,6 +102,164 @@ def _acquire_local_polling_singleton() -> None:
         )
         raise SystemExit(1)
     _POLLING_SINGLETON_SOCKET = sock
+
+
+def _polling_lock_collection(client: MongoClient):
+    return client[DB_NAME].runtime_locks
+
+
+def _format_lock_owner(doc: dict | None) -> str:
+    if not doc:
+        return "unknown"
+    owner = doc.get("owner") or "unknown"
+    host = doc.get("hostname") or "unknown-host"
+    pid = doc.get("pid") or "unknown-pid"
+    expires_at = doc.get("expires_at") or "unknown-expiry"
+    return f"owner={owner}, host={host}, pid={pid}, expires_at={expires_at}"
+
+
+def _acquire_distributed_polling_lock() -> None:
+    """Allow only one polling bot across all deployments using MongoDB.
+
+    This catches the case that causes Telegram 409 Conflict on platforms that
+    accidentally start multiple containers/workers with the same bot token. The
+    lock only controls getUpdates polling. WebAdmin may still use the bot token
+    for sending messages/files because it does not poll Telegram updates.
+    """
+    global _POLLING_LOCK_CLIENT, _POLLING_LOCK_OWNER, _POLLING_LOCK_KEY, _POLLING_LOCK_THREAD
+    if _POLLING_LOCK_CLIENT is not None:
+        return
+
+    token_hash = _token_hash()
+    lock_key = f"telegram_polling:{token_hash}"
+    owner = f"{socket.gethostname()}:{_os.getpid()}:{uuid.uuid4().hex[:8]}"
+    now = _now_utc()
+    expires_at = now + timedelta(seconds=_POLLING_LOCK_TTL_SECONDS)
+
+    try:
+        client = MongoClient(
+            MONGO_URI,
+            tls=True,
+            tlsAllowInvalidCertificates=True,
+            serverSelectionTimeoutMS=15000,
+        )
+        client.admin.command("ping")
+        locks = _polling_lock_collection(client)
+        locks.create_index("key", unique=True)
+        locks.create_index("expires_at", expireAfterSeconds=0)
+
+        update = {
+            "$set": {
+                "key": lock_key,
+                "purpose": "telegram_getupdates_polling",
+                "owner": owner,
+                "hostname": socket.gethostname(),
+                "pid": _os.getpid(),
+                "token_hash_prefix": token_hash[:12],
+                "updated_at": now,
+                "expires_at": expires_at,
+            }
+        }
+        lock_doc = locks.find_one_and_update(
+            {
+                "key": lock_key,
+                "$or": [
+                    {"expires_at": {"$lte": now}},
+                    {"expires_at": {"$exists": False}},
+                    {"owner": owner},
+                ],
+            },
+            update,
+            upsert=True,
+            return_document=ReturnDocument.AFTER,
+        )
+    except DuplicateKeyError:
+        try:
+            active = _polling_lock_collection(client).find_one({"key": lock_key})
+        except Exception:
+            active = None
+        logger.error(
+            "❌ Telegram polling lock is already held by another running bot instance (%s). "
+            "This process will exit before calling getUpdates to avoid Telegram 409 Conflict. "
+            "Stop duplicate bot services/workers/replicas, wait up to 3 minutes for stale locks, then restart one bot only.",
+            _format_lock_owner(active),
+        )
+        try:
+            client.close()
+        except Exception:
+            pass
+        raise SystemExit(1)
+    except PyMongoError as exc:
+        logger.error(
+            "❌ Could not verify the Telegram polling singleton lock in MongoDB: %s. "
+            "Bot will not start because starting without this check can create duplicate polling conflicts.",
+            exc,
+        )
+        raise SystemExit(1)
+
+    if not lock_doc or lock_doc.get("owner") != owner:
+        logger.error(
+            "❌ Telegram polling lock was not acquired (%s). Stop duplicate bot instances and restart one bot only.",
+            _format_lock_owner(lock_doc),
+        )
+        try:
+            client.close()
+        except Exception:
+            pass
+        raise SystemExit(1)
+
+    _POLLING_LOCK_CLIENT = client
+    _POLLING_LOCK_OWNER = owner
+    _POLLING_LOCK_KEY = lock_key
+    _POLLING_LOCK_STOP.clear()
+    _POLLING_LOCK_THREAD = threading.Thread(target=_polling_lock_heartbeat, name="telegram-polling-lock", daemon=True)
+    _POLLING_LOCK_THREAD.start()
+    atexit.register(_release_distributed_polling_lock)
+    logger.info("✅ Telegram polling lock acquired: %s", owner)
+
+
+def _polling_lock_heartbeat() -> None:
+    while not _POLLING_LOCK_STOP.wait(_POLLING_LOCK_HEARTBEAT_SECONDS):
+        try:
+            if not (_POLLING_LOCK_CLIENT and _POLLING_LOCK_KEY and _POLLING_LOCK_OWNER):
+                return
+            now = _now_utc()
+            result = _polling_lock_collection(_POLLING_LOCK_CLIENT).update_one(
+                {"key": _POLLING_LOCK_KEY, "owner": _POLLING_LOCK_OWNER},
+                {"$set": {"updated_at": now, "expires_at": now + timedelta(seconds=_POLLING_LOCK_TTL_SECONDS)}},
+            )
+            if not result.matched_count:
+                logger.error("❌ Telegram polling lock was lost. Exiting to avoid duplicate getUpdates polling.")
+                _os._exit(1)
+        except Exception as exc:
+            logger.error("❌ Telegram polling lock heartbeat failed: %s. Exiting to avoid duplicate polling.", exc)
+            _os._exit(1)
+
+
+def _release_distributed_polling_lock() -> None:
+    global _POLLING_LOCK_CLIENT, _POLLING_LOCK_OWNER, _POLLING_LOCK_KEY
+    _POLLING_LOCK_STOP.set()
+    client = _POLLING_LOCK_CLIENT
+    key = _POLLING_LOCK_KEY
+    owner = _POLLING_LOCK_OWNER
+    if client and key and owner:
+        try:
+            _polling_lock_collection(client).delete_one({"key": key, "owner": owner})
+            logger.info("✅ Telegram polling lock released: %s", owner)
+        except Exception as exc:
+            logger.warning("⚠️ Could not release Telegram polling lock cleanly: %s", exc)
+        try:
+            client.close()
+        except Exception:
+            pass
+    _POLLING_LOCK_CLIENT = None
+    _POLLING_LOCK_OWNER = None
+    _POLLING_LOCK_KEY = None
+
+
+def _acquire_polling_singletons() -> None:
+    _acquire_local_polling_singleton()
+    _acquire_distributed_polling_lock()
 
 
 PAYMENT_ALLOWED_DURING_MAINTENANCE_PREFIXES = (
@@ -359,14 +535,29 @@ async def post_init(application):
     logger.info("✅ Bot started in user-only mode. Use WebAdmin for all admin actions.")
 
 
+async def log_runtime_error(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Make Telegram polling conflicts clear instead of repeating stack traces."""
+    error = getattr(context, "error", None)
+    if isinstance(error, Conflict):
+        logger.error(
+            "❌ Telegram returned 409 Conflict. Another bot process is already calling getUpdates with this token. "
+            "Check duplicate hosting workers/replicas/services. This process will exit instead of retrying forever."
+        )
+        _release_distributed_polling_lock()
+        _os._exit(1)
+    logger.exception("Unhandled bot error", exc_info=error)
+
+
 def main():
-    _acquire_local_polling_singleton()
+    _acquire_polling_singletons()
     app = (
         ApplicationBuilder()
         .token(BOT_TOKEN)
         .post_init(post_init)
         .build()
     )
+
+    app.add_error_handler(log_runtime_error)
 
     # ── Cancel stale input flows when users start another command/menu action ──
     app.add_handler(MessageHandler(filters.COMMAND, clear_input_flows_on_new_command_or_navigation), group=-2)
@@ -411,7 +602,10 @@ def main():
     app.add_handler(MessageHandler(filters.PHOTO, handle_photo))
 
     logger.info("🚀 Starting bot...")
-    app.run_polling(allowed_updates=Update.ALL_TYPES)
+    try:
+        app.run_polling(allowed_updates=Update.ALL_TYPES)
+    finally:
+        _release_distributed_polling_lock()
 
 
 if __name__ == "__main__":
