@@ -32,6 +32,7 @@ def _split_csv(value: str) -> list[str]:
 MONGO_URI: str = _required("MONGO_URI")
 DB_NAME: str = os.getenv("DB_NAME", "shopbot").strip() or "shopbot"
 SECRET_SETTINGS_KEY = "secret_settings"
+RUNTIME_BOT_TOKEN_KEY = "telegram_bot_token"
 
 
 def mask_secret_value(value: str | None, *, keep_left: int = 4, keep_right: int = 4) -> str:
@@ -65,6 +66,12 @@ def mask_bot_token(value: str | None) -> str:
 
 
 def _load_secret_settings() -> dict:
+    """Load WebAdmin-managed secrets from MongoDB.
+
+    The Telegram bot token is read from runtime_config.telegram_bot_token first.
+    This makes the latest token saved from WebAdmin authoritative even if an old
+    value is still present in the legacy settings document.
+    """
     try:
         client = MongoClient(
             MONGO_URI,
@@ -72,10 +79,19 @@ def _load_secret_settings() -> dict:
             tlsAllowInvalidCertificates=True,
             serverSelectionTimeoutMS=30000,
         )
-        doc = client[DB_NAME].settings.find_one({"key": SECRET_SETTINGS_KEY}) or {}
+        db = client[DB_NAME]
+        doc = db.settings.find_one({"key": SECRET_SETTINGS_KEY}) or {}
         value = doc.get("value") if isinstance(doc, dict) else {}
+        settings = dict(value) if isinstance(value, dict) else {}
+
+        token_doc = db.runtime_config.find_one({"key": RUNTIME_BOT_TOKEN_KEY}) or {}
+        runtime_token = str(token_doc.get("value") or "").strip() if isinstance(token_doc, dict) else ""
+        if runtime_token:
+            settings["bot_token"] = runtime_token
+            settings["bot_token_runtime_updated_at"] = token_doc.get("updated_at")
+        settings["secret_settings_updated_at"] = doc.get("updated_at") if isinstance(doc, dict) else None
         client.close()
-        return value if isinstance(value, dict) else {}
+        return settings
     except Exception:
         # Keep config import readable; the required-token error below gives the
         # admin a clear action after WebAdmin is configured.
@@ -113,7 +129,9 @@ def _secret_int(key: str, default: int) -> int:
 
 # Telegram
 BOT_TOKEN: str = _secret_required("bot_token", "Telegram bot token")
-BOT_TOKEN_SOURCE: str = f"MongoDB WebAdmin Secret Settings ({DB_NAME}.settings/key={SECRET_SETTINGS_KEY})"
+BOT_TOKEN_SOURCE: str = f"MongoDB WebAdmin runtime_config/key={RUNTIME_BOT_TOKEN_KEY}, fallback {DB_NAME}.settings/key={SECRET_SETTINGS_KEY}"
+BOT_TOKEN_RUNTIME_UPDATED_AT = _SECRET_SETTINGS.get("bot_token_runtime_updated_at")
+SECRET_SETTINGS_UPDATED_AT = _SECRET_SETTINGS.get("secret_settings_updated_at")
 BOT_TOKEN_PREVIEW: str = mask_bot_token(BOT_TOKEN)
 BOT_TOKEN_FINGERPRINT: str = secret_fingerprint(BOT_TOKEN)
 LEGACY_ENV_BOT_TOKEN_NAMES: tuple[str, ...] = ("BOT_TOKEN", "TELEGRAM_BOT_TOKEN", "TG_BOT_TOKEN")

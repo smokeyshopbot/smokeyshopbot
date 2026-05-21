@@ -18,7 +18,7 @@ from telegram.ext import ContextTypes
 
 import database as db
 from utils.i18n import tr
-from utils.crypto import generate_unique_usdt_amount
+from utils.crypto import UniqueUsdtAmountUnavailable, generate_unique_usdt_amount
 from utils.wallet_history import (
     WALLET_HISTORY_PAGE_SIZE,
     format_wallet_history_text,
@@ -265,7 +265,13 @@ async def handle_wallet_amount_input(update: Update, context: ContextTypes.DEFAU
 
     elif currency == "binance_usdt":
         amount_usdt = round(amount, 2)
-        unique_usdt = await generate_unique_usdt_amount(amount_usdt)
+        try:
+            unique_usdt = await generate_unique_usdt_amount(amount_usdt)
+        except UniqueUsdtAmountUnavailable:
+            await update.message.reply_text(
+                "⚠️ Too many active Binance Pay payments are using this exact amount right now. Please try again in a few minutes."
+            )
+            return True
         await db.create_pending_payment(
             user_id=user_id, ref_id=ref_id, pay_type="wallet",
             method="binance", expected_inr=0.0, expected_usdt=amount_usdt,
@@ -280,7 +286,13 @@ async def handle_wallet_amount_input(update: Update, context: ContextTypes.DEFAU
 
     else:  # usdt via BEP20
         amount_usdt = round(amount, 2)
-        unique_usdt = await generate_unique_usdt_amount(amount_usdt)
+        try:
+            unique_usdt = await generate_unique_usdt_amount(amount_usdt)
+        except UniqueUsdtAmountUnavailable:
+            await update.message.reply_text(
+                "⚠️ Too many active USDT payments are using this exact amount right now. Please try again in a few minutes."
+            )
+            return True
         await db.create_pending_payment(
             user_id=user_id, ref_id=ref_id, pay_type="wallet",
             method="usdt", expected_inr=0.0, expected_usdt=amount_usdt,

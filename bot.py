@@ -10,6 +10,7 @@ import os
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 import logging
+import re
 import hashlib
 import socket
 import atexit
@@ -34,6 +35,7 @@ from pymongo.errors import DuplicateKeyError, PyMongoError
 
 from config import (
     BOT_TOKEN, BOT_TOKEN_SOURCE, BOT_TOKEN_PREVIEW, BOT_TOKEN_FINGERPRINT, LEGACY_ENV_BOT_TOKEN_NAMES,
+    BOT_TOKEN_RUNTIME_UPDATED_AT, SECRET_SETTINGS_UPDATED_AT,
     is_admin_id, MONGO_URI, DB_NAME, mask_bot_token, secret_fingerprint,
 )
 import database as db
@@ -61,10 +63,29 @@ from handlers.replacements import (
     cmd_report, handle_report_text, handle_report_photo, handle_report_callbacks, is_report_flow_active, clear_report_flow,
 )
 
+class _TelegramTokenRedactionFilter(logging.Filter):
+    _token_pattern = re.compile(r"/bot[0-9]{5,}:[A-Za-z0-9_\-]+")
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        try:
+            message = record.getMessage()
+            redacted = self._token_pattern.sub("/bot<redacted>", message)
+            if redacted != message:
+                record.msg = redacted
+                record.args = ()
+        except Exception:
+            pass
+        return True
+
+
 logging.basicConfig(
     format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
     level=logging.INFO,
 )
+logging.getLogger().addFilter(_TelegramTokenRedactionFilter())
+# httpx logs full Telegram API URLs at INFO, including bot tokens. Keep it quiet
+# so tokens never leak into hosting logs.
+logging.getLogger("httpx").setLevel(logging.WARNING)
 logger = logging.getLogger(__name__)
 
 
@@ -92,6 +113,8 @@ def _log_token_source() -> None:
     logger.info("🔐 Bot token source: %s", BOT_TOKEN_SOURCE)
     logger.info("🔐 Bot token in use: %s", BOT_TOKEN_PREVIEW)
     logger.info("🔐 MongoDB database in use: %s", DB_NAME)
+    logger.info("🔐 Token runtime_config updated_at: %s", BOT_TOKEN_RUNTIME_UPDATED_AT or "not set")
+    logger.info("🔐 Secret settings updated_at: %s", SECRET_SETTINGS_UPDATED_AT or "not set")
     for env_name in LEGACY_ENV_BOT_TOKEN_NAMES:
         env_token = str(_os.getenv(env_name) or "").strip()
         if not env_token:

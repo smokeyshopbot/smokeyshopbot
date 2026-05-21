@@ -20,7 +20,7 @@ from telegram.ext import ContextTypes
 
 import database as db
 from config import SUPPORT_USERNAMES
-from utils.crypto import generate_unique_usdt_amount
+from utils.crypto import UniqueUsdtAmountUnavailable, generate_unique_usdt_amount
 from utils.messages import commands_text, compact_blank_lines, md_code, telegram_id, order_amount_text
 from utils.i18n import tr, language_name, normalize_lang, SUPPORTED_LANGUAGES
 from handlers.replacements import start_report_from_query
@@ -461,7 +461,12 @@ def _order_items_caption(order: dict, *, is_refetch: bool = False, lang: str = "
             f"📦 {tr(lang, 'product')}: {product_name}\n"
             f"🔢 {tr(lang, 'quantity')}: {quantity}"
         )
-    title = tr(lang, "previous_order_items") if is_refetch else tr(lang, "order_placed_confirmed")
+    if is_refetch:
+        title = tr(lang, "previous_order_items")
+    elif order.get("admin_stock_delivery"):
+        title = tr(lang, "admin_stock_sent")
+    else:
+        title = tr(lang, "order_placed_confirmed")
     return (
         f"{title}\n\n"
         f"🧾 {tr(lang, 'order_id')}: {order_id}\n"
@@ -1299,11 +1304,17 @@ async def handle_payment_method_select(update: Update, context: ContextTypes.DEF
         return
 
     # ── External payment ──
-    order_id = await db.create_order(user_id, product["name"], qty, method, total_inr, total_usdt, query.from_user.username or "")
-    description = f"{tr(lang, 'order_id')} `{order_id}` | {product['name']} x{qty}"
-
     if method == "usdt":
-        unique_usdt = await generate_unique_usdt_amount(total_usdt)
+        try:
+            unique_usdt = await generate_unique_usdt_amount(total_usdt)
+        except UniqueUsdtAmountUnavailable:
+            await context.bot.send_message(
+                user_id,
+                "⚠️ Too many active USDT payments are using this exact amount right now. Please try again in a few minutes."
+            )
+            return
+        order_id = await db.create_order(user_id, product["name"], qty, method, total_inr, total_usdt, query.from_user.username or "")
+        description = f"{tr(lang, 'order_id')} `{order_id}` | {product['name']} x{qty}"
         await db.create_pending_payment(
             user_id=user_id, ref_id=order_id, pay_type="order",
             method="usdt", expected_inr=total_inr, expected_usdt=total_usdt,
@@ -1317,6 +1328,8 @@ async def handle_payment_method_select(update: Update, context: ContextTypes.DEF
         )
 
     elif method == "upi":
+        order_id = await db.create_order(user_id, product["name"], qty, method, total_inr, total_usdt, query.from_user.username or "")
+        description = f"{tr(lang, 'order_id')} `{order_id}` | {product['name']} x{qty}"
         await db.create_pending_payment(
             user_id=user_id, ref_id=order_id, pay_type="order",
             method="upi", expected_inr=total_inr, expected_usdt=total_usdt,
@@ -1329,7 +1342,16 @@ async def handle_payment_method_select(update: Update, context: ContextTypes.DEF
         )
 
     elif method == "binance":
-        unique_usdt = await generate_unique_usdt_amount(total_usdt)
+        try:
+            unique_usdt = await generate_unique_usdt_amount(total_usdt)
+        except UniqueUsdtAmountUnavailable:
+            await context.bot.send_message(
+                user_id,
+                "⚠️ Too many active Binance Pay payments are using this exact amount right now. Please try again in a few minutes."
+            )
+            return
+        order_id = await db.create_order(user_id, product["name"], qty, method, total_inr, total_usdt, query.from_user.username or "")
+        description = f"{tr(lang, 'order_id')} `{order_id}` | {product['name']} x{qty}"
         await db.create_pending_payment(
             user_id=user_id, ref_id=order_id, pay_type="order",
             method="binance", expected_inr=0.0, expected_usdt=total_usdt,

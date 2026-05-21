@@ -930,16 +930,31 @@ async def get_bot_stats() -> dict:
     }
 
 
+def _buyer_ranking_match() -> dict:
+    """Only real paid buyer orders should affect Buyer Ranking.
+
+    Free admin stock sends and replacement deliveries are delivered order records too,
+    but they are not paid purchases, so they must not move buyer ranks.
+    """
+    return {
+        "status": {"$in": ["delivered", "pending_stock"]},
+        "is_replacement": {"$ne": True},
+        "admin_stock_delivery": {"$ne": True},
+        "payment_method": {"$nin": ["admin_stock", "replacement"]},
+        "$or": [{"amount_inr": {"$gt": 0}}, {"amount_usdt": {"$gt": 0}}],
+    }
+
+
 async def get_buyer_ranking(limit: int = 10, skip: int = 0) -> list[dict]:
     """Return top buyers by paid order value with user info.
 
-    Counts delivered orders and paid orders waiting for stock. Pending/unpaid,
-    failed, and expired orders are excluded.
+    Counts delivered paid orders and paid orders waiting for stock. Pending/unpaid,
+    failed, expired, replacements, and free admin stock sends are excluded.
     """
     limit = max(1, min(int(limit or 10), 50))
     skip = max(0, int(skip or 0))
     pipeline = [
-        {"$match": {"status": {"$in": ["delivered", "pending_stock"]}}},
+        {"$match": _buyer_ranking_match()},
         {"$group": {
             "_id": "$user_id",
             "total_orders": {"$sum": 1},
@@ -975,9 +990,9 @@ async def get_buyer_ranking(limit: int = 10, skip: int = 0) -> list[dict]:
 
 
 async def count_ranked_buyers() -> int:
-    """Count users with at least one paid-value order."""
+    """Count users with at least one real paid buyer order."""
     rows = await get_db().orders.aggregate([
-        {"$match": {"status": {"$in": ["delivered", "pending_stock"]}}},
+        {"$match": _buyer_ranking_match()},
         {"$group": {"_id": "$user_id"}},
         {"$count": "count"},
     ]).to_list(length=1)
@@ -1147,7 +1162,16 @@ async def get_setting(key: str, default=None):
 
 async def get_secret_settings() -> dict:
     value = await get_setting("secret_settings", {})
-    return value if isinstance(value, dict) else {}
+    settings = dict(value) if isinstance(value, dict) else {}
+    try:
+        token_doc = await get_db().runtime_config.find_one({"key": "telegram_bot_token"})
+        runtime_token = str((token_doc or {}).get("value") or "").strip()
+        if runtime_token:
+            settings["bot_token"] = runtime_token
+            settings["bot_token_runtime_updated_at"] = (token_doc or {}).get("updated_at")
+    except Exception:
+        pass
+    return settings
 
 
 def parse_positive_int(value, default: int, *, minimum: int = 1) -> int:
