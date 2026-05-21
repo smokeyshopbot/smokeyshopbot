@@ -83,12 +83,22 @@ def _price_usdt_label(value) -> str:
 
 
 def _price_label(product: dict, settings: dict, *, quantity: int = 1, lang: str = "en") -> str:
-    """Show only enabled product prices. Crypto payment pages show only the unique 3-decimal send amount."""
+    """Show enabled product prices with USDT first as the default display currency.
+
+    Normal shop/order summaries stay at 2 decimals. Crypto payment instruction
+    pages still use the separate unique 3-decimal send amount.
+    """
     parts = []
-    if _payment_enabled(settings, "upi"):
-        parts.append(_price_inr_label(float(product.get('price_inr') or 0) * quantity))
-    if _payment_enabled(settings, "wallet_usdt"):
+    usdt_enabled = (
+        _payment_enabled(settings, "usdt")
+        or _payment_enabled(settings, "binance")
+        or _payment_enabled(settings, "wallet_usdt")
+    )
+    inr_enabled = _payment_enabled(settings, "upi") or _payment_enabled(settings, "wallet_inr")
+    if usdt_enabled:
         parts.append(_price_usdt_label(float(product.get('price_usdt') or 0) * quantity))
+    if inr_enabled:
+        parts.append(_price_inr_label(float(product.get('price_inr') or 0) * quantity))
     return " / ".join(parts) if parts else tr(lang, "payment_not_configured")
 
 
@@ -280,12 +290,12 @@ def _wallet_keyboard(lang: str = "en") -> InlineKeyboardMarkup:
 async def _load_wallet_keyboard(lang: str = "en") -> tuple[InlineKeyboardMarkup, bool]:
     settings = await db.get_payment_settings()
     rows: list[list[InlineKeyboardButton]] = []
-    if _payment_enabled(settings, "upi"):
-        rows.append([InlineKeyboardButton(tr(lang, "wallet_topup_inr"), callback_data="wallet_currency:inr")])
     if _payment_enabled(settings, "usdt"):
         rows.append([InlineKeyboardButton(tr(lang, "wallet_topup_usdt"), callback_data="wallet_currency:usdt")])
     if _payment_enabled(settings, "binance"):
         rows.append([InlineKeyboardButton(tr(lang, "wallet_topup_binance"), callback_data="wallet_currency:binance_usdt")])
+    if _payment_enabled(settings, "upi"):
+        rows.append([InlineKeyboardButton(tr(lang, "wallet_topup_inr"), callback_data="wallet_currency:inr")])
     has_methods = bool(rows)
     rows.append(_back_button(lang))
     return InlineKeyboardMarkup(rows), has_methods
@@ -855,10 +865,10 @@ async def handle_nav_buttons(update: Update, context: ContextTypes.DEFAULT_TYPE)
         usdt_bal = float(user.get("wallet_usdt", 0.0) if user else 0.0)
         payment_settings = await db.get_payment_settings()
         lines = [tr(lang, "wallet_title"), ""]
-        if _payment_enabled(payment_settings, "wallet_inr"):
-            lines.append(tr(lang, "wallet_inr_balance", balance=f"{inr_bal:.2f}"))
         if _payment_enabled(payment_settings, "wallet_usdt"):
             lines.append(tr(lang, "wallet_usdt_balance", balance=_compact_amount(usdt_bal, 2)))
+        if _payment_enabled(payment_settings, "wallet_inr"):
+            lines.append(tr(lang, "wallet_inr_balance", balance=f"{inr_bal:.2f}"))
         if len(lines) == 2:
             lines.append(tr(lang, "wallet_no_currency"))
         await query.edit_message_text(
@@ -1163,20 +1173,20 @@ async def handle_quantity_input(update: Update, context: ContextTypes.DEFAULT_TY
     }
 
     buttons = []
-    if wallet_inr_ok:
-        buttons.append([InlineKeyboardButton(
-            tr(lang, "wallet_inr_available", balance=f"{wallet_inr:.2f}"), callback_data="pay:wallet_inr"
-        )])
     if wallet_usdt_ok:
         buttons.append([InlineKeyboardButton(
             tr(lang, "wallet_usdt_available", balance=_compact_amount(wallet_usdt, 2)), callback_data="pay:wallet_usdt"
         )])
     if _payment_enabled(payment_settings, "usdt"):
         buttons.append([InlineKeyboardButton(tr(lang, "pay_usdt"), callback_data="pay:usdt")])
-    if _payment_enabled(payment_settings, "upi"):
-        buttons.append([InlineKeyboardButton(tr(lang, "pay_upi"), callback_data="pay:upi")])
     if _payment_enabled(payment_settings, "binance"):
         buttons.append([InlineKeyboardButton(tr(lang, "pay_binance"), callback_data="pay:binance")])
+    if wallet_inr_ok:
+        buttons.append([InlineKeyboardButton(
+            tr(lang, "wallet_inr_available", balance=f"{wallet_inr:.2f}"), callback_data="pay:wallet_inr"
+        )])
+    if _payment_enabled(payment_settings, "upi"):
+        buttons.append([InlineKeyboardButton(tr(lang, "pay_upi"), callback_data="pay:upi")])
 
     if not buttons:
         _shop_flow.pop(user_id, None)

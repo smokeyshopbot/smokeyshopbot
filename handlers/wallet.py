@@ -72,12 +72,12 @@ def _wallet_keyboard(lang: str = "en") -> InlineKeyboardMarkup:
 async def _load_wallet_keyboard(lang: str = "en") -> tuple[InlineKeyboardMarkup, bool]:
     settings = await db.get_payment_settings()
     rows: list[list[InlineKeyboardButton]] = []
-    if _payment_enabled(settings, "upi"):
-        rows.append([InlineKeyboardButton(tr(lang, "wallet_topup_inr"), callback_data="wallet_currency:inr")])
     if _payment_enabled(settings, "usdt"):
         rows.append([InlineKeyboardButton(tr(lang, "wallet_topup_usdt"), callback_data="wallet_currency:usdt")])
     if _payment_enabled(settings, "binance"):
         rows.append([InlineKeyboardButton(tr(lang, "wallet_topup_binance"), callback_data="wallet_currency:binance_usdt")])
+    if _payment_enabled(settings, "upi"):
+        rows.append([InlineKeyboardButton(tr(lang, "wallet_topup_inr"), callback_data="wallet_currency:inr")])
     has_methods = bool(rows)
     rows.append(_back_button(lang))
     return InlineKeyboardMarkup(rows), has_methods
