@@ -467,12 +467,17 @@ def _order_items_caption(order: dict, *, is_refetch: bool = False, lang: str = "
         title = tr(lang, "admin_stock_sent")
     else:
         title = tr(lang, "order_placed_confirmed")
-    return (
+    caption = (
         f"{title}\n\n"
         f"🧾 {tr(lang, 'order_id')}: {order_id}\n"
         f"📦 {tr(lang, 'product')}: {product_name}\n"
         f"🔢 {tr(lang, 'quantity')}: {quantity}"
     )
+    if order.get("admin_stock_delivery") and not is_refetch:
+        note = str(order.get("admin_stock_note") or "").strip()
+        if note:
+            caption += f"\n\n📝 Admin note: {note[:700]}"
+    return caption
 
 
 async def _reply_order_items_file(update: Update, order: dict, *, is_refetch: bool = False) -> None:
