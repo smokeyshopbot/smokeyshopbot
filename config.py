@@ -8,6 +8,7 @@ are managed from WebAdmin → Secret Settings and stored in MongoDB.
 from __future__ import annotations
 
 import os
+import hashlib
 from dotenv import load_dotenv
 from pymongo import MongoClient
 
@@ -31,6 +32,36 @@ def _split_csv(value: str) -> list[str]:
 MONGO_URI: str = _required("MONGO_URI")
 DB_NAME: str = os.getenv("DB_NAME", "shopbot").strip() or "shopbot"
 SECRET_SETTINGS_KEY = "secret_settings"
+
+
+def mask_secret_value(value: str | None, *, keep_left: int = 4, keep_right: int = 4) -> str:
+    """Return a safe preview for logs/UI without exposing the secret."""
+    raw = str(value or "").strip()
+    if not raw:
+        return "missing"
+    if len(raw) <= keep_left + keep_right:
+        return "saved"
+    return f"{raw[:keep_left]}…{raw[-keep_right:]}"
+
+
+def secret_fingerprint(value: str | None) -> str:
+    raw = str(value or "").strip()
+    if not raw:
+        return "missing"
+    return hashlib.sha256(raw.encode("utf-8")).hexdigest()[:12]
+
+
+def mask_bot_token(value: str | None) -> str:
+    """Mask Telegram bot tokens while keeping enough info to compare configs."""
+    raw = str(value or "").strip()
+    if not raw:
+        return "missing"
+    if ":" not in raw:
+        return f"saved / sha256:{secret_fingerprint(raw)}"
+    bot_id, token_secret = raw.split(":", 1)
+    safe_id = mask_secret_value(bot_id, keep_left=4, keep_right=2)
+    safe_secret = mask_secret_value(token_secret, keep_left=0, keep_right=4)
+    return f"bot_id {safe_id}:{safe_secret} / sha256:{secret_fingerprint(raw)}"
 
 
 def _load_secret_settings() -> dict:
@@ -82,6 +113,10 @@ def _secret_int(key: str, default: int) -> int:
 
 # Telegram
 BOT_TOKEN: str = _secret_required("bot_token", "Telegram bot token")
+BOT_TOKEN_SOURCE: str = f"MongoDB WebAdmin Secret Settings ({DB_NAME}.settings/key={SECRET_SETTINGS_KEY})"
+BOT_TOKEN_PREVIEW: str = mask_bot_token(BOT_TOKEN)
+BOT_TOKEN_FINGERPRINT: str = secret_fingerprint(BOT_TOKEN)
+LEGACY_ENV_BOT_TOKEN_NAMES: tuple[str, ...] = ("BOT_TOKEN", "TELEGRAM_BOT_TOKEN", "TG_BOT_TOKEN")
 
 # Telegram admin panel commands are removed, but these IDs are allowed to use
 # the bot while maintenance mode is ON for testing. Configure in WebAdmin →

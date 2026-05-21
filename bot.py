@@ -32,7 +32,10 @@ from telegram.error import Conflict
 from pymongo import MongoClient, ReturnDocument
 from pymongo.errors import DuplicateKeyError, PyMongoError
 
-from config import BOT_TOKEN, is_admin_id, MONGO_URI, DB_NAME
+from config import (
+    BOT_TOKEN, BOT_TOKEN_SOURCE, BOT_TOKEN_PREVIEW, BOT_TOKEN_FINGERPRINT, LEGACY_ENV_BOT_TOKEN_NAMES,
+    is_admin_id, MONGO_URI, DB_NAME, mask_bot_token, secret_fingerprint,
+)
 import database as db
 from utils.i18n import tr
 
@@ -77,6 +80,30 @@ _POLLING_LOCK_HEARTBEAT_SECONDS = 30
 
 def _token_hash() -> str:
     return hashlib.sha256(str(BOT_TOKEN).encode("utf-8")).hexdigest()
+
+
+def _log_token_source() -> None:
+    """Make token-source problems visible without printing the real token.
+
+    The bot intentionally uses the token saved in WebAdmin Secret Settings via
+    MongoDB. Legacy environment token variables are ignored so an old hosting
+    variable cannot silently override the WebAdmin token.
+    """
+    logger.info("🔐 Bot token source: %s", BOT_TOKEN_SOURCE)
+    logger.info("🔐 Bot token in use: %s", BOT_TOKEN_PREVIEW)
+    logger.info("🔐 MongoDB database in use: %s", DB_NAME)
+    for env_name in LEGACY_ENV_BOT_TOKEN_NAMES:
+        env_token = str(_os.getenv(env_name) or "").strip()
+        if not env_token:
+            continue
+        if secret_fingerprint(env_token) == BOT_TOKEN_FINGERPRINT:
+            logger.info("ℹ️ Legacy env %s is set but matches WebAdmin token; WebAdmin token is still used.", env_name)
+        else:
+            logger.warning(
+                "⚠️ Ignoring legacy env %s token (%s). This bot uses the WebAdmin/MongoDB token (%s). "
+                "Remove the old env token from hosting to avoid confusion.",
+                env_name, mask_bot_token(env_token), BOT_TOKEN_PREVIEW,
+            )
 
 
 def _now_utc() -> datetime:
@@ -549,6 +576,7 @@ async def log_runtime_error(update: object, context: ContextTypes.DEFAULT_TYPE) 
 
 
 def main():
+    _log_token_source()
     _acquire_polling_singletons()
     app = (
         ApplicationBuilder()

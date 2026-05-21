@@ -9,7 +9,7 @@ A fully-featured Telegram shop bot with USDT BEP20 auto-verification, manual UPI
 ```
 telegram-shop-bot/
 ├── bot.py                  # Entry point — run this
-├── config.py               # Loads .env variables
+├── config.py               # Loads MongoDB bootstrap + WebAdmin Secret Settings
 ├── database.py             # MongoDB helpers (users, products, orders, payments)
 ├── handlers/
 │   ├── admin.py            # All admin commands & UPI approval flow
@@ -40,22 +40,14 @@ pip install -r requirements.txt
 ```bash
 cp .env.example .env
 ```
-Fill in all values in `.env`:
+Fill in only the MongoDB bootstrap values in `.env`:
 
 | Variable | Description |
 |---|---|
-| `BOT_TOKEN` | From @BotFather on Telegram |
-| `ADMIN_IDS` | Comma-separated Telegram numeric admin IDs, e.g. `111111111,222222222` |
-| `MONGO_URI` | MongoDB Atlas connection string |
-| Payment details | Manage BEP20 wallet, UPI details, and Binance Pay details from WebAdmin → Payment Settings. These are stored in MongoDB, not `.env`. |
-| `BSCSCAN_API_KEY` | Legacy/compatibility explorer key, optional |
-| `ETHERSCAN_API_KEY` | Etherscan API V2 key for BNB Chain `chainid=56`, optional/paid-tier may be required |
-| `BSC_RPC_URLS` | Comma-separated BSC RPC fallbacks for BEP20 auto-verification |
-| `BEP20_REQUIRED_CONFIRMATIONS` | BSC confirmations required before auto-confirming payment; default `3` |
-| `PAYMENT_REMINDER_MINUTES` | Sends unpaid payment reminder after this many minutes; default `20` |
-| `PAYMENT_TIMEOUT_MINUTES` | Expires unpaid payment sessions after this many minutes; default `30` |
-| `LOW_STOCK_ALERT_THRESHOLD` | Admin alert threshold; default is 10 units |
-| `SUPPORT_USERNAMES` | Comma-separated Telegram support usernames or links shown to users |
+| `MONGO_URI` | MongoDB Atlas connection string. Bot and WebAdmin must use the exact same database. |
+| `DB_NAME` | MongoDB database name. Bot and WebAdmin must match exactly. |
+
+Do **not** put the Telegram bot token in the bot service `.env`. The bot token, admin/tester IDs, support usernames, explorer API keys, timing settings, and other secrets are managed from **WebAdmin → Secret Settings** and stored in MongoDB. Restart the bot after changing the bot token or timing settings.
 
 ### 4. Run the bot
 ```bash
@@ -354,3 +346,17 @@ The bot runs a global BEP20 auto-verification watcher in the background. This wa
 ### Wallet History Top-up Again
 
 The `/wallethistory` page includes a **➕ Top-up Again** button under pagination and above Back.
+
+---
+
+## Bot token troubleshooting
+
+The Telegram polling bot reads the token from MongoDB WebAdmin Secret Settings, not from `.env`. On startup it logs a masked token preview and fingerprint, for example:
+
+```text
+🔐 Bot token source: MongoDB WebAdmin Secret Settings
+🔐 Bot token in use: bot_id 1234…90:…abcd / sha256:xxxxxxxxxxxx
+🔐 MongoDB database in use: shopbot
+```
+
+In WebAdmin → System Health, the Bot token check shows the same masked preview/fingerprint. If the bot log and WebAdmin System Health show different fingerprints, your Bot and WebAdmin services are connected to different `MONGO_URI`/`DB_NAME` values or one service was not redeployed/restarted.
