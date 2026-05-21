@@ -10,6 +10,8 @@ import os
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 import logging
+import hashlib
+import socket
 from telegram import Update
 from telegram.ext import (
     ApplicationBuilder,
@@ -52,6 +54,36 @@ logging.basicConfig(
     level=logging.INFO,
 )
 logger = logging.getLogger(__name__)
+
+
+_POLLING_SINGLETON_SOCKET: socket.socket | None = None
+
+
+def _acquire_local_polling_singleton() -> None:
+    """Prevent accidental double polling in the same server/container.
+
+    Telegram only allows one active getUpdates poller per bot token. This local
+    guard catches the common deployment mistake where the same service starts
+    bot.py twice on the same machine. It does not replace the Telegram-side
+    protection, but it exits with a clearer message before polling starts.
+    """
+    global _POLLING_SINGLETON_SOCKET
+    if _POLLING_SINGLETON_SOCKET is not None:
+        return
+
+    token_hash = hashlib.sha256(str(BOT_TOKEN).encode("utf-8")).hexdigest()
+    port = 20000 + (int(token_hash[:8], 16) % 20000)
+    sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    try:
+        sock.bind(("127.0.0.1", port))
+        sock.listen(1)
+    except OSError:
+        logger.error(
+            "❌ Another local process on this server/container is already running this Telegram bot. "
+            "Stop the duplicate process, or make sure the WebAdmin service is not running bot.py."
+        )
+        raise SystemExit(1)
+    _POLLING_SINGLETON_SOCKET = sock
 
 
 PAYMENT_ALLOWED_DURING_MAINTENANCE_PREFIXES = (
@@ -328,6 +360,7 @@ async def post_init(application):
 
 
 def main():
+    _acquire_local_polling_singleton()
     app = (
         ApplicationBuilder()
         .token(BOT_TOKEN)
