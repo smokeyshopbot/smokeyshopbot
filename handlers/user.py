@@ -114,6 +114,27 @@ def _product_description_block(product: dict, lang: str = "en") -> str:
     return tr(selected_lang, "product_description_block", description=description)
 
 
+def _product_warranty_block(product: dict, lang: str = "en") -> str:
+    """Optional per-product warranty shown under the description in the product details."""
+    selected_lang = normalize_lang(lang)
+    try:
+        warranty_days = int(product.get("warranty_days") or 0)
+    except (TypeError, ValueError):
+        warranty_days = 0
+    if warranty_days <= 0:
+        return ""
+    return tr(selected_lang, "product_warranty_block", days=warranty_days, day_label=tr(selected_lang, "day" if warranty_days == 1 else "days"))
+
+
+def _product_details_block(product: dict, lang: str = "en") -> str:
+    return compact_blank_lines("\n\n".join(
+        block for block in (
+            _product_description_block(product, lang),
+            _product_warranty_block(product, lang),
+        ) if block
+    ))
+
+
 def _ellipsize(text: str, max_len: int) -> str:
     text = str(text or "").strip()
     if len(text) <= max_len:
@@ -380,10 +401,13 @@ def _status_emoji(status: str) -> str:
         "failed": "❌",
         "expired": "❌",
         "confirmed": "✅",
+        "revoked": "🚫",
     }.get((status or "").lower(), "❓")
 
 
 def _status_label(status: str, lang: str = "en") -> str:
+    if (status or "").lower() == "revoked":
+        return "Revoked"
     key = {
         "pending_stock": "status_pending_stock",
         "pending": "status_pending",
@@ -391,6 +415,7 @@ def _status_label(status: str, lang: str = "en") -> str:
         "failed": "status_failed",
         "expired": "status_expired",
         "confirmed": "status_confirmed",
+        "revoked": "delivery_revoked",
     }.get((status or "unknown").lower())
     return tr(lang, key) if key else str(status or "unknown").replace("_", " ").title()
 
@@ -414,13 +439,14 @@ def _format_user_orders_text(orders: list[dict], page: int = 0, total_count: int
     ]
     for order in orders:
         order_id = order.get("order_id", "N/A")
+        display_status = "revoked" if order.get("delivery_revoked") else order.get("status")
         lines.extend([
             f"{tr(lang, 'order_id')}: `{order_id}`",
             f"{tr(lang, 'date_time')}: {_format_dt(order.get('created_at'))}",
             f"{tr(lang, 'payment_method')}: `{str(order.get('payment_method', 'N/A')).upper()}`",
             f"{tr(lang, 'product')}: *{order.get('product_name', 'N/A')}* x{order.get('quantity', 0)}",
-            f"{tr(lang, 'status')}: {_status_emoji(order.get('status'))} {_status_label(order.get('status'), lang)}",
-            f"{tr(lang, 'fetch_again')}: {_getorder_shortcut(order_id)}",
+            f"{tr(lang, 'status')}: {_status_emoji(display_status)} {_status_label(display_status, lang)}",
+            f"{tr(lang, 'fetch_again')}: {'Disabled by admin' if order.get('delivery_revoked') else _getorder_shortcut(order_id)}",
             "",
         ])
     return compact_blank_lines("\n".join(lines))
@@ -483,9 +509,15 @@ def _order_items_caption(order: dict, *, is_refetch: bool = False, lang: str = "
         f"📦 {tr(lang, 'product')}: {product_name}\n"
         f"🔢 {tr(lang, 'quantity')}: {quantity}"
     )
-    if order.get("admin_stock_delivery") and not is_refetch:
+    if (
+        order.get("admin_stock_delivery")
+        and not is_refetch
+        and not order.get("delivery_transfer")
+        and str(order.get("admin_stock_source") or "").strip().lower() != "transfer"
+    ):
         note = str(order.get("admin_stock_note") or "").strip()
-        if note:
+        note_lower = note.lower()
+        if note and not note_lower.startswith(("transferred from revoked order", "transferred from revoked replacement")):
             caption += f"\n\n📝 Admin note: {note[:700]}"
     return caption
 
@@ -496,10 +528,18 @@ async def _reply_order_items_file(update: Update, order: dict, *, is_refetch: bo
     document = io.BytesIO(data)
     document.name = _order_items_txt_filename(order)
     caption = _order_items_caption(order, is_refetch=is_refetch, lang=lang)
-    await update.message.reply_document(
+    sent_message = await update.message.reply_document(
         document=document,
         filename=document.name,
         caption=caption,
+    )
+    await db.record_order_delivery_message(
+        str(order.get("order_id") or ""),
+        update.effective_chat.id if update.effective_chat else update.effective_user.id,
+        getattr(sent_message, "message_id", None),
+        filename=document.name,
+        sent_by="user_refetch",
+        resent=True,
     )
 
 
@@ -507,7 +547,7 @@ def _format_order_delivery_text(order: dict, *, is_refetch: bool = False, lang: 
     order_id = order.get("order_id", "N/A")
     product_name = order.get("product_name", "N/A")
     quantity = order.get("quantity", 0)
-    status = order.get("status", "unknown")
+    status = "revoked" if order.get("delivery_revoked") else order.get("status", "unknown")
     items = order.get("items", []) or []
     is_replacement = bool(order.get("is_replacement"))
     id_label = tr(lang, "replacement_id") if is_replacement else tr(lang, "order_id")
@@ -577,6 +617,7 @@ def _format_user_replacements_text(replacements: list[dict], page: int = 0, tota
     ]
     for order in replacements:
         order_id = order.get("order_id", "N/A")
+        display_status = "revoked" if order.get("delivery_revoked") else order.get("status")
         report_id = order.get("replacement_report_id", "N/A")
         original_orders = ", ".join(str(x) for x in (order.get("original_order_ids") or []) if str(x).strip()) or str(order.get("original_order_id") or "N/A")
         lines.extend([
@@ -585,8 +626,8 @@ def _format_user_replacements_text(replacements: list[dict], page: int = 0, tota
             f"{tr(lang, 'date_time')}: {_format_dt(order.get('created_at'))}",
             f"{tr(lang, 'product')}: *{order.get('product_name', 'N/A')}* x{order.get('quantity', 0)}",
             f"{tr(lang, 'original_order')}: `{original_orders}`",
-            f"{tr(lang, 'status')}: {_status_emoji(order.get('status'))} {_status_label(order.get('status'), lang)}",
-            f"{tr(lang, 'fetch_again')}: {_getorder_shortcut(order_id)}",
+            f"{tr(lang, 'status')}: {_status_emoji(display_status)} {_status_label(display_status, lang)}",
+            f"{tr(lang, 'fetch_again')}: {'Disabled by admin' if order.get('delivery_revoked') else _getorder_shortcut(order_id)}",
             "",
         ])
     return compact_blank_lines("\n".join(lines))
@@ -812,6 +853,10 @@ async def handle_get_order_lookup(update: Update, context: ContextTypes.DEFAULT_
 
     if int(order.get("user_id", 0)) != int(user_id):
         await update.message.reply_text(tr(lang, "order_not_yours"))
+        return True
+
+    if order.get("delivery_revoked"):
+        await update.message.reply_text("🚫 This delivery was revoked by admin, so it can no longer be fetched from the bot.")
         return True
 
     if order.get("status") == "delivered" and (order.get("items") or []):
@@ -1075,7 +1120,7 @@ async def _show_quantity_prompt(query, user_id: int, product_name: str, *, back_
 
     _shop_flow[user_id] = {"step": "quantity", "product": product}
     await query.edit_message_text(
-        compact_blank_lines(tr(lang, "quantity_prompt", product=product['name'], description=_product_description_block(product, lang), price=_price_label(product, payment_settings, lang=lang), stock=stock_count)),
+        compact_blank_lines(tr(lang, "quantity_prompt", product=product['name'], description=_product_details_block(product, lang), price=_price_label(product, payment_settings, lang=lang), stock=stock_count)),
         parse_mode="Markdown",
         reply_markup=back_keyboard
     )

@@ -290,7 +290,7 @@ async def get_product_by_id(product_id: str) -> Optional[dict]:
     return await get_db().products.find_one({"_id": oid})
 
 
-async def add_product(name: str, price_inr: float, price_usdt: float, shop_order: int | None = None) -> bool:
+async def add_product(name: str, price_inr: float, price_usdt: float, shop_order: int | None = None, warranty_days: int = 0) -> bool:
     existing = await get_product(name)
     if existing:
         return False
@@ -304,6 +304,7 @@ async def add_product(name: str, price_inr: float, price_usdt: float, shop_order
         "max_order_quantity": 100,
         "low_stock_threshold": 10,
         "low_stock_alert_sent": False,
+        "warranty_days": max(0, int(warranty_days or 0)),
         "created_at": datetime.now(timezone.utc),
     }
     parsed_order = parse_product_shop_order(shop_order)
@@ -702,6 +703,48 @@ async def update_order_status(order_id: str, status: str, items: list[str] = Non
     if status == "pending_stock":
         update["$set"].setdefault("pending_stock_at", now)
     await get_db().orders.update_one({"order_id": order_id}, update)
+
+
+async def record_order_delivery_message(
+    order_id: str,
+    chat_id: int | str,
+    message_id: int | str,
+    *,
+    filename: str = "",
+    sent_by: str = "bot",
+    resent: bool = False,
+):
+    """Save Telegram message IDs for delivered stock files so WebAdmin can revoke/delete them later."""
+    clean_order_id = str(order_id or "").strip().upper()
+    if not clean_order_id:
+        return
+    try:
+        clean_chat_id = int(chat_id)
+        clean_message_id = int(message_id)
+    except (TypeError, ValueError):
+        return
+    now = datetime.now(timezone.utc)
+    entry = {
+        "chat_id": clean_chat_id,
+        "message_id": clean_message_id,
+        "filename": str(filename or "").strip(),
+        "sent_at": now,
+        "sent_by": str(sent_by or "bot").strip()[:80],
+        "resent": bool(resent),
+    }
+    await get_db().orders.update_one(
+        {"order_id": clean_order_id},
+        {
+            "$set": {
+                "delivery_chat_id": clean_chat_id,
+                "delivery_message_id": clean_message_id,
+                "delivery_message_sent_at": now,
+                "delivery_filename": entry["filename"],
+                "delivery_telegram_deleted": False,
+            },
+            "$push": {"delivery_telegram_messages": entry},
+        },
+    )
 
 
 async def mark_order_pending_stock(order_id: str):

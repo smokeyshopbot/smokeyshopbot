@@ -1148,11 +1148,19 @@ async def _send_delivery_txt_file(bot, user_id: int, order: dict, items: list[st
     document = io.BytesIO(data)
     document.name = _delivery_txt_filename(order)
     try:
-        await bot.send_document(
+        sent_message = await bot.send_document(
             chat_id=user_id,
             document=document,
             filename=document.name,
             caption=_delivery_caption(order, from_pending=from_pending, lang=lang),
+        )
+        await db.record_order_delivery_message(
+            str(order.get("order_id") or ""),
+            user_id,
+            getattr(sent_message, "message_id", None),
+            filename=document.name,
+            sent_by="bot_delivery",
+            resent=bool(order.get("resent_by_admin")),
         )
     except Exception:
         logger.exception("Could not send delivery txt file for order=%s", order.get("order_id"))
