@@ -563,6 +563,13 @@ async def post_init(application):
             partial_filter={"usdt_txn_hash": {"$type": "string", "$gt": ""}},
         )
         await _ensure_unique_index_safely(
+            db_conn.pending_payments,
+            [("usdt_txn_hash_key", 1)],
+            name="uniq_usdt_txn_hash_key_nonempty",
+            duplicate_field="usdt_txn_hash_key",
+            partial_filter={"usdt_txn_hash_key": {"$type": "string", "$gt": ""}},
+        )
+        await _ensure_unique_index_safely(
             db_conn.orders,
             [("order_id", 1)],
             name="uniq_order_id",
