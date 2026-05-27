@@ -54,7 +54,8 @@ from handlers.payment import (
     is_payment_manual_input_active, clear_payment_manual_flows,
     resume_pending_usdt_payments, resume_pending_payment_notices, start_usdt_global_watcher,
     resume_pending_binance_payments, start_binance_global_watcher,
-    recover_stuck_wallet_orders, start_stale_unpaid_expiry_watcher,
+    recover_stuck_wallet_orders, recover_pending_stock_orders,
+    start_pending_stock_recovery_watcher, start_stale_unpaid_expiry_watcher,
 )
 from handlers.wallet import (
     cmd_wallet, cmd_load_wallet, cmd_wallet_history,
@@ -592,6 +593,11 @@ async def post_init(application):
         logger.exception("⚠️ Could not recover stuck wallet orders: %s", e)
 
     try:
+        await recover_pending_stock_orders(application.bot)
+    except Exception as e:
+        logger.exception("⚠️ Could not recover pending-stock orders: %s", e)
+
+    try:
         await resume_pending_usdt_payments(application)
     except Exception as e:
         logger.exception("⚠️ Could not resume per-payment BEP20 tasks: %s", e)
@@ -605,6 +611,11 @@ async def post_init(application):
         await resume_pending_payment_notices(application)
     except Exception as e:
         logger.exception("⚠️ Could not resume payment reminder/expiry tasks: %s", e)
+
+    try:
+        await start_pending_stock_recovery_watcher(application)
+    except Exception as e:
+        logger.exception("⚠️ Could not start pending-stock recovery watcher: %s", e)
 
     try:
         await start_stale_unpaid_expiry_watcher(application)
