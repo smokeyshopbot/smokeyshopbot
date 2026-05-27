@@ -46,6 +46,7 @@ from handlers.user import (
     cmd_start, cmd_commands, cmd_support, cmd_shop, cmd_favorites, cmd_language, cmd_orders as cmd_user_orders_command, cmd_replacements,
     handle_nav_buttons, handle_language_select, handle_product_select, handle_get_order_lookup,
     handle_payment_method_select, handle_quantity_input, handle_favorite_button, clear_shop_flow,
+    handle_refund_choice, handle_refund_detail_input, is_refund_flow_active, clear_refund_flow,
 )
 from handlers.payment import (
     handle_check_usdt, handle_upi_paid_button, handle_upi_text_input, handle_upi_screenshot,
@@ -351,6 +352,8 @@ PAYMENT_ALLOWED_DURING_MAINTENANCE_PREFIXES = (
     "usdt_manual:",
     "upi_paid:",
     "binance_paid:",
+    "refund_wallet:",
+    "refund_request:",
 )
 
 
@@ -389,7 +392,7 @@ async def maintenance_guard(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if data.startswith(PAYMENT_ALLOWED_DURING_MAINTENANCE_PREFIXES):
             return
 
-    if update.message and is_payment_manual_input_active(user.id):
+    if update.message and (is_payment_manual_input_active(user.id) or is_refund_flow_active(user.id)):
         return
 
     lang = await db.get_user_language(user.id)
@@ -416,6 +419,7 @@ def _clear_user_input_flows(user_id: int | str | None, *, include_payment_manual
     clear_report_flow(user_id)
     clear_shop_flow(user_id)
     clear_wallet_flow(user_id)
+    clear_refund_flow(user_id)
     if include_payment_manual:
         clear_payment_manual_flows(user_id)
 
@@ -443,11 +447,16 @@ async def clear_input_flows_on_new_command_or_navigation(update: Update, context
         # half-finished report. Do not clear shop flow for payment buttons.
         if data.startswith(("nav:", "product:", "product_id:", "favorite_buy:", "favorite_buy_id:", "wallet_currency:")):
             clear_report_flow(user.id)
+            clear_refund_flow(user.id)
 
 
 async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     if await db.is_blocked(user_id):
+        return
+
+    # Cancelled-order refund detail input
+    if await handle_refund_detail_input(update, context):
         return
 
     # Replacement/report flow
@@ -688,6 +697,7 @@ def main():
     app.add_handler(CallbackQueryHandler(handle_product_select, pattern=r"^(product:|product_id:)"))
     app.add_handler(CallbackQueryHandler(handle_favorite_button, pattern=r"^(fav:|fav_id:|favorite_product:|favorite_product_id:|favorite_buy:|favorite_buy_id:)"))
     app.add_handler(CallbackQueryHandler(handle_payment_method_select, pattern=r"^pay:"))
+    app.add_handler(CallbackQueryHandler(handle_refund_choice, pattern=r"^refund_(wallet|request):"))
     app.add_handler(CallbackQueryHandler(handle_check_usdt, pattern=r"^check_usdt:"))
     app.add_handler(CallbackQueryHandler(handle_check_binance, pattern=r"^check_binance:"))
     app.add_handler(CallbackQueryHandler(handle_usdt_manual_button, pattern=r"^usdt_manual:"))
