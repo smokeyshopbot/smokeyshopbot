@@ -90,12 +90,43 @@ def _refund_amount_text(order: dict | None) -> str:
     return f"${amount:.2f} USDT"
 
 
-def _refund_choice_keyboard(order_id: str, lang: str = "en") -> InlineKeyboardMarkup:
-    clean_order_id = str(order_id or "").strip().upper()
-    return InlineKeyboardMarkup([
-        [InlineKeyboardButton(tr(lang, "refund_add_to_wallet"), callback_data=f"refund_wallet:{clean_order_id}")],
-        [InlineKeyboardButton(tr(lang, "refund_request_external"), callback_data=f"refund_request:{clean_order_id}")],
-    ])
+def _refund_choice_keyboard(order: dict | None, lang: str = "en") -> InlineKeyboardMarkup | None:
+    """Return only the refund buttons that admin allowed for this cancelled order."""
+    order = order or {}
+    if str(order.get("refund_status") or "").strip().lower() != "waiting_user_choice":
+        return None
+    clean_order_id = str(order.get("order_id") or "").strip().upper()
+    if not clean_order_id:
+        return None
+    buttons: list[list[InlineKeyboardButton]] = []
+    if order.get("refund_wallet_enabled"):
+        buttons.append([InlineKeyboardButton(tr(lang, "refund_add_to_wallet"), callback_data=f"refund_wallet:{clean_order_id}")])
+    if order.get("refund_external_enabled"):
+        buttons.append([InlineKeyboardButton(tr(lang, "refund_request_external"), callback_data=f"refund_request:{clean_order_id}")])
+    return InlineKeyboardMarkup(buttons) if buttons else None
+
+
+def _refund_status_message(order: dict | None, lang: str = "en") -> str:
+    refund_status = str((order or {}).get("refund_status") or "").strip().lower()
+    if refund_status == "waiting_user_choice":
+        return tr(lang, "cancelled_order_refund_available") if _refund_choice_keyboard(order, lang) else tr(lang, "cancelled_order_no_options")
+    if refund_status == "wallet_credited":
+        return tr(lang, "cancelled_order_wallet_credited")
+    if refund_status == "refund_requested":
+        return tr(lang, "cancelled_order_refund_requested")
+    if refund_status == "refund_paid":
+        return tr(lang, "cancelled_order_refund_paid")
+    return tr(lang, "cancelled_order_no_options")
+
+
+def _is_cancelled_pending_stock_order(order: dict | None) -> bool:
+    order = order or {}
+    return bool(order.get("pending_stock_cancelled")) or (
+        str(order.get("status") or "").strip().lower() == "cancelled"
+        and str(order.get("refund_status") or "").strip().lower() in {
+            "waiting_user_choice", "wallet_credited", "refund_requested", "refund_paid", "not_eligible"
+        }
+    )
 
 
 ORDERS_PAGE_SIZE = 10
@@ -523,6 +554,7 @@ def _status_emoji(status: str) -> str:
         "expired": "❌",
         "confirmed": "✅",
         "cancelled": "❌",
+        "waiting_user_choice": "🔁",
         "refund_requested": "🔁",
         "wallet_credited": "✅",
         "refund_paid": "✅",
@@ -541,6 +573,7 @@ def _status_label(status: str, lang: str = "en") -> str:
         "expired": "status_expired",
         "confirmed": "status_confirmed",
         "cancelled": "status_cancelled",
+        "waiting_user_choice": "status_waiting_user_choice",
         "refund_requested": "status_refund_requested",
         "wallet_credited": "status_wallet_credited",
         "refund_paid": "status_refund_paid",
@@ -571,6 +604,8 @@ def _format_user_orders_text(orders: list[dict], page: int = 0, total_count: int
         refund_status = str(order.get("refund_status") or "").strip().lower()
         if order.get("delivery_revoked"):
             display_status = "revoked"
+        elif refund_status == "waiting_user_choice":
+            display_status = "waiting_user_choice"
         elif refund_status == "refund_requested":
             display_status = "refund_requested"
         elif refund_status == "wallet_credited":
@@ -689,6 +724,8 @@ def _format_order_delivery_text(order: dict, *, is_refetch: bool = False, lang: 
     refund_status = str(order.get("refund_status") or "").strip().lower()
     if order.get("delivery_revoked"):
         status = "revoked"
+    elif refund_status == "waiting_user_choice":
+        status = "waiting_user_choice"
     elif refund_status == "refund_requested":
         status = "refund_requested"
     elif refund_status == "wallet_credited":
@@ -702,14 +739,22 @@ def _format_order_delivery_text(order: dict, *, is_refetch: bool = False, lang: 
     id_label = tr(lang, "replacement_id") if is_replacement else tr(lang, "order_id")
 
     if status != "delivered" or not items:
-        return (
+        details = (
             f"📦 *{id_label} `{order_id}`*\n\n"
             f"{tr(lang, 'product')}: *{product_name}* x{quantity}\n"
             f"{tr(lang, 'date_time')}: {_format_dt(order.get('created_at'))}\n"
             f"{tr(lang, 'payment_method')}: {str(order.get('payment_method', 'N/A')).upper()}\n"
-            f"{tr(lang, 'status')}: {_status_emoji(status)} {_status_label(status, lang)}\n\n"
-            f"{tr(lang, 'no_delivered_items')}"
+            f"{tr(lang, 'status')}: {_status_emoji(status)} {_status_label(status, lang)}"
         )
+        if _is_cancelled_pending_stock_order(order):
+            note = str(order.get("cancel_note") or "").strip()
+            if refund_status in {"waiting_user_choice", "wallet_credited", "refund_requested", "refund_paid"}:
+                details += f"\n{tr(lang, 'refund_amount_label')}: *{_refund_amount_text(order)}*"
+            if note:
+                details += f"\n{tr(lang, 'admin_note')}: {md_code(note[:700])}"
+            details += f"\n\n{_refund_status_message(order, lang)}"
+            return details
+        return details + f"\n\n{tr(lang, 'no_delivered_items')}"
 
     if is_replacement:
         title = f"🎁 *{tr(lang, 'previous_replacement_items').replace('📄 ', '')}*" if is_refetch else f"✅ *{tr(lang, 'replacement_items_title')}*"
@@ -769,6 +814,8 @@ def _format_user_replacements_text(replacements: list[dict], page: int = 0, tota
         refund_status = str(order.get("refund_status") or "").strip().lower()
         if order.get("delivery_revoked"):
             display_status = "revoked"
+        elif refund_status == "waiting_user_choice":
+            display_status = "waiting_user_choice"
         elif refund_status == "refund_requested":
             display_status = "refund_requested"
         elif refund_status == "wallet_credited":
@@ -1023,7 +1070,8 @@ async def handle_get_order_lookup(update: Update, context: ContextTypes.DEFAULT_
     else:
         await update.message.reply_text(
             _format_order_delivery_text(order, is_refetch=True, lang=lang),
-            parse_mode="Markdown"
+            parse_mode="Markdown",
+            reply_markup=_refund_choice_keyboard(order, lang),
         )
     return True
 
