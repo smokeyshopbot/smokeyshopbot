@@ -382,9 +382,15 @@ async def maintenance_guard(update: Update, context: ContextTypes.DEFAULT_TYPE):
       still verify payment and receive their completed order/wallet result.
     """
     user = update.effective_user
-    if not user or await is_maintenance_exempt_user(user.id):
+    if not user:
         return
+
+    # Fast path: when maintenance is OFF, avoid the extra secret-settings/admin
+    # exemption lookup on every single user command/callback. This keeps normal
+    # bot actions quick while preserving the same maintenance behavior.
     if not await db.is_maintenance_mode():
+        return
+    if await is_maintenance_exempt_user(user.id):
         return
 
     if update.callback_query:
