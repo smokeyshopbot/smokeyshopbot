@@ -22,6 +22,7 @@ from datetime import datetime, timezone, timedelta
 from telegram import Update
 from telegram.ext import (
     ApplicationBuilder,
+    ExtBot,
     CommandHandler,
     CallbackQueryHandler,
     MessageHandler,
@@ -562,42 +563,56 @@ def _outgoing_text_preview_from_kwargs(kind: str, kwargs: dict, args: tuple) -> 
     return str(kwargs.get("caption") or kwargs.get("filename") or kind or "")
 
 
-def _install_sent_notification_logger(bot) -> None:
-    """Record outgoing bot message IDs for the WebAdmin recent-delete panel."""
-    methods = {
-        "send_message": "message",
-        "send_photo": "photo",
-        "send_document": "document",
-        "send_video": "video",
-        "send_animation": "animation",
-    }
-    if getattr(bot, "_sent_notification_logger_installed", False):
-        return
-    for method_name, kind in methods.items():
-        original = getattr(bot, method_name, None)
-        if original is None:
-            continue
+async def _record_outgoing_notification(kind: str, method_name: str, result, args: tuple, kwargs: dict) -> None:
+    """Record an outgoing Telegram message without mutating PTB's frozen Bot object."""
+    try:
+        chat_id = kwargs.get("chat_id") or (args[0] if args else None)
+        await db.record_sent_notification(
+            chat_id,
+            result,
+            text=_outgoing_text_preview_from_kwargs(kind, kwargs, args),
+            notification_type=kind,
+            title=f"Bot {kind}",
+            source=f"telegram_bot:{method_name}",
+            parse_mode=kwargs.get("parse_mode"),
+            target_kind="customer",
+        )
+    except Exception:
+        logger.debug("Could not record outgoing Telegram %s notification", method_name, exc_info=True)
 
-        async def wrapped(*args, __original=original, __method_name=method_name, __kind=kind, **kwargs):
-            result = await __original(*args, **kwargs)
-            try:
-                chat_id = kwargs.get("chat_id") or (args[0] if args else None)
-                await db.record_sent_notification(
-                    chat_id,
-                    result,
-                    text=_outgoing_text_preview_from_kwargs(__kind, kwargs, args),
-                    notification_type=__kind,
-                    title=f"Bot {__kind}",
-                    source=f"telegram_bot:{__method_name}",
-                    parse_mode=kwargs.get("parse_mode"),
-                    target_kind="customer",
-                )
-            except Exception:
-                logger.debug("Could not record outgoing Telegram %s notification", __method_name, exc_info=True)
-            return result
 
-        setattr(bot, method_name, wrapped)
-    setattr(bot, "_sent_notification_logger_installed", True)
+class NotificationRecordingBot(ExtBot):
+    """ExtBot that records sent message IDs for WebAdmin's recent-delete panel.
+
+    python-telegram-bot freezes Bot instances, so assigning wrapped methods with
+    setattr(app.bot, "send_message", ...) crashes at startup. Defining the
+    wrappers on a subclass keeps the same behavior without mutating the instance.
+    """
+
+    async def send_message(self, *args, **kwargs):
+        result = await super().send_message(*args, **kwargs)
+        await _record_outgoing_notification("message", "send_message", result, args, kwargs)
+        return result
+
+    async def send_photo(self, *args, **kwargs):
+        result = await super().send_photo(*args, **kwargs)
+        await _record_outgoing_notification("photo", "send_photo", result, args, kwargs)
+        return result
+
+    async def send_document(self, *args, **kwargs):
+        result = await super().send_document(*args, **kwargs)
+        await _record_outgoing_notification("document", "send_document", result, args, kwargs)
+        return result
+
+    async def send_video(self, *args, **kwargs):
+        result = await super().send_video(*args, **kwargs)
+        await _record_outgoing_notification("video", "send_video", result, args, kwargs)
+        return result
+
+    async def send_animation(self, *args, **kwargs):
+        result = await super().send_animation(*args, **kwargs)
+        await _record_outgoing_notification("animation", "send_animation", result, args, kwargs)
+        return result
 
 
 async def post_init(application):
@@ -717,11 +732,10 @@ def main():
     _acquire_polling_singletons()
     app = (
         ApplicationBuilder()
-        .token(BOT_TOKEN)
+        .bot(NotificationRecordingBot(token=BOT_TOKEN))
         .post_init(post_init)
         .build()
     )
-    _install_sent_notification_logger(app.bot)
 
     app.add_error_handler(log_runtime_error)
 
