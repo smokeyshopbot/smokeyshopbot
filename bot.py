@@ -555,6 +555,51 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
 
+
+def _outgoing_text_preview_from_kwargs(kind: str, kwargs: dict, args: tuple) -> str:
+    if kind == "message":
+        return str(kwargs.get("text") or (args[1] if len(args) > 1 else "") or "")
+    return str(kwargs.get("caption") or kwargs.get("filename") or kind or "")
+
+
+def _install_sent_notification_logger(bot) -> None:
+    """Record outgoing bot message IDs for the WebAdmin recent-delete panel."""
+    methods = {
+        "send_message": "message",
+        "send_photo": "photo",
+        "send_document": "document",
+        "send_video": "video",
+        "send_animation": "animation",
+    }
+    if getattr(bot, "_sent_notification_logger_installed", False):
+        return
+    for method_name, kind in methods.items():
+        original = getattr(bot, method_name, None)
+        if original is None:
+            continue
+
+        async def wrapped(*args, __original=original, __method_name=method_name, __kind=kind, **kwargs):
+            result = await __original(*args, **kwargs)
+            try:
+                chat_id = kwargs.get("chat_id") or (args[0] if args else None)
+                await db.record_sent_notification(
+                    chat_id,
+                    result,
+                    text=_outgoing_text_preview_from_kwargs(__kind, kwargs, args),
+                    notification_type=__kind,
+                    title=f"Bot {__kind}",
+                    source=f"telegram_bot:{__method_name}",
+                    parse_mode=kwargs.get("parse_mode"),
+                    target_kind="customer",
+                )
+            except Exception:
+                logger.debug("Could not record outgoing Telegram %s notification", __method_name, exc_info=True)
+            return result
+
+        setattr(bot, method_name, wrapped)
+    setattr(bot, "_sent_notification_logger_installed", True)
+
+
 async def post_init(application):
     try:
         db_conn = db.get_db()
@@ -595,6 +640,10 @@ async def post_init(application):
         await db_conn.orders.create_index([("status", 1), ("user_id", 1)])
         await db_conn.products.create_index([("name", 1), ("enabled", 1)])
         await db_conn.settings.create_index("key", unique=True)
+        await db_conn.sent_notifications.create_index([("sent_at", -1)])
+        await db_conn.sent_notifications.create_index([("batch_id", 1), ("sent_at", -1)])
+        await db_conn.sent_notifications.create_index([("chat_id", 1), ("message_id", 1)], unique=True, sparse=True)
+        await db_conn.sent_notifications.create_index([("expires_at", 1)])
         await db_conn.replacement_reports.create_index("report_id", unique=True)
         await db_conn.replacement_reports.create_index([("status", 1), ("created_at", -1)])
         await db_conn.replacement_reports.create_index([("user_id", 1), ("created_at", -1)])
@@ -672,6 +721,7 @@ def main():
         .post_init(post_init)
         .build()
     )
+    _install_sent_notification_logger(app.bot)
 
     app.add_error_handler(log_runtime_error)
 

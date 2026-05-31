@@ -22,7 +22,7 @@ from motor.motor_asyncio import AsyncIOMotorClient
 from pymongo import ReturnDocument
 from pymongo.errors import DuplicateKeyError
 from bson import ObjectId
-from config import MONGO_URI, DB_NAME
+from config import MONGO_URI, DB_NAME, is_admin_id
 
 _client: Optional[AsyncIOMotorClient] = None
 _db = None
@@ -401,6 +401,127 @@ def filter_stock_against_approved_pool(product: dict, items: list[str]) -> tuple
         else:
             rejected.append(clean)
     return accepted, rejected
+
+
+
+TELEGRAM_DELETE_WINDOW_HOURS = 48
+
+
+def _notification_preview(text_value: Any, limit: int = 220) -> str:
+    text_clean = str(text_value or "").strip()
+    text_clean = re.sub(r"<[^>]+>", " ", text_clean)
+    text_clean = re.sub(r"\s+", " ", text_clean).strip()
+    if len(text_clean) > limit:
+        return text_clean[: limit - 1].rstrip() + "…"
+    return text_clean
+
+
+def _notification_type_label(value: str | None) -> str:
+    key = str(value or "message").strip().lower()
+    return {
+        "broadcast": "Broadcast",
+        "new_product": "New product",
+        "new_stock": "Fresh stock",
+        "price_drop": "Price drop",
+        "photo": "Photo",
+        "document": "Document",
+        "message": "Message",
+    }.get(key, key.replace("_", " ").title())
+
+
+def _message_result_message_id(result: Any) -> int | None:
+    if isinstance(result, dict):
+        value = result.get("message_id")
+    else:
+        value = getattr(result, "message_id", None)
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _message_result_chat_id(result: Any) -> int | None:
+    chat_value = None
+    if isinstance(result, dict):
+        chat = result.get("chat") if isinstance(result.get("chat"), dict) else {}
+        chat_value = chat.get("id")
+    else:
+        chat = getattr(result, "chat", None)
+        chat_value = getattr(chat, "id", None) or getattr(result, "chat_id", None)
+    try:
+        return int(chat_value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _message_result_date(result: Any) -> datetime | None:
+    value = result.get("date") if isinstance(result, dict) else getattr(result, "date", None)
+    if isinstance(value, datetime):
+        dt = value
+    elif isinstance(value, (int, float)):
+        try:
+            dt = datetime.fromtimestamp(float(value), tz=timezone.utc)
+        except Exception:
+            return None
+    else:
+        return None
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    return dt.astimezone(timezone.utc)
+
+
+async def record_sent_notification(
+    chat_id: int | str | None,
+    message_result: Any,
+    *,
+    text: str = "",
+    notification_type: str = "message",
+    batch_id: str | None = None,
+    title: str = "",
+    source: str = "telegram_bot",
+    product_name: str = "",
+    parse_mode: str | None = None,
+    target_kind: str = "customer",
+) -> None:
+    """Store outgoing Telegram message IDs for WebAdmin's recent-delete panel."""
+    message_id = _message_result_message_id(message_result)
+    result_chat_id = _message_result_chat_id(message_result)
+    try:
+        clean_chat_id = int(result_chat_id if result_chat_id is not None else (chat_id or 0))
+    except (TypeError, ValueError):
+        clean_chat_id = 0
+    if not clean_chat_id or not message_id:
+        return
+    if target_kind == "customer" and is_admin_id(clean_chat_id):
+        return
+    sent_at = _message_result_date(message_result) or datetime.now(timezone.utc)
+    clean_type = str(notification_type or "message").strip().lower() or "message"
+    doc = {
+        "batch_id": str(batch_id or f"{clean_type}:{uuid.uuid4().hex}"),
+        "notification_type": clean_type,
+        "title": _notification_preview(title or _notification_type_label(clean_type), 140),
+        "text_preview": _notification_preview(text),
+        "product_name": str(product_name or "").strip(),
+        "source": str(source or "telegram_bot").strip(),
+        "target_kind": str(target_kind or "customer").strip(),
+        "chat_id": clean_chat_id,
+        "user_id": clean_chat_id,
+        "message_id": int(message_id),
+        "parse_mode": str(parse_mode or "").strip(),
+        "sent_at": sent_at,
+        "expires_at": sent_at + timedelta(hours=TELEGRAM_DELETE_WINDOW_HOURS),
+        "deleted": False,
+        "created_at": datetime.now(timezone.utc),
+        "updated_at": datetime.now(timezone.utc),
+    }
+    try:
+        await get_db().sent_notifications.update_one(
+            {"chat_id": clean_chat_id, "message_id": int(message_id)},
+            {"$setOnInsert": doc, "$set": {"updated_at": datetime.now(timezone.utc)}},
+            upsert=True,
+        )
+    except Exception:
+        pass
 
 
 def get_db():
