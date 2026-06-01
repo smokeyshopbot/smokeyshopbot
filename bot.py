@@ -38,7 +38,8 @@ from pymongo.errors import DuplicateKeyError, PyMongoError
 from config import (
     BOT_TOKEN, BOT_TOKEN_SOURCE, BOT_TOKEN_PREVIEW, BOT_TOKEN_FINGERPRINT, LEGACY_ENV_BOT_TOKEN_NAMES,
     BOT_TOKEN_RUNTIME_UPDATED_AT, SECRET_SETTINGS_UPDATED_AT,
-    is_admin_id, MONGO_URI, DB_NAME, mask_bot_token, secret_fingerprint,
+    is_admin_id, MONGO_URI, DB_NAME, MONGO_TLS_ALLOW_INVALID_CERTIFICATES,
+    mask_bot_token, secret_fingerprint,
 )
 import database as db
 from utils.i18n import tr
@@ -198,7 +199,7 @@ def _acquire_distributed_polling_lock() -> None:
         client = MongoClient(
             MONGO_URI,
             tls=True,
-            tlsAllowInvalidCertificates=True,
+            tlsAllowInvalidCertificates=MONGO_TLS_ALLOW_INVALID_CERTIFICATES,
             serverSelectionTimeoutMS=15000,
         )
         client.admin.command("ping")
@@ -578,7 +579,7 @@ async def _record_outgoing_notification(kind: str, method_name: str, result, arg
             target_kind="customer",
         )
     except Exception:
-        logger.debug("Could not record outgoing Telegram %s notification", method_name, exc_info=True)
+        logger.warning("Could not record outgoing Telegram %s notification", method_name, exc_info=True)
 
 
 class NotificationRecordingBot(ExtBot):

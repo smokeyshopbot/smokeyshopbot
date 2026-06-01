@@ -10,6 +10,7 @@ Collections:
 """
 
 from __future__ import annotations
+import logging
 import re
 import hashlib
 import time
@@ -23,11 +24,12 @@ from motor.motor_asyncio import AsyncIOMotorClient
 from pymongo import ReturnDocument
 from pymongo.errors import DuplicateKeyError
 from bson import ObjectId
-from config import MONGO_URI, DB_NAME, is_admin_id
+from config import MONGO_URI, DB_NAME, MONGO_TLS_ALLOW_INVALID_CERTIFICATES, is_admin_id
 
 _client: Optional[AsyncIOMotorClient] = None
 _db = None
 _SETTING_CACHE: dict[str, tuple[float, Any]] = {}
+logger = logging.getLogger(__name__)
 
 
 def _cache_get(key: str, ttl_seconds: float) -> Any:
@@ -516,13 +518,19 @@ async def record_sent_notification(
         "updated_at": datetime.now(timezone.utc),
     }
     try:
+        now_update = datetime.now(timezone.utc)
+        set_fields = {key: value for key, value in doc.items() if key not in {"created_at", "deleted"}}
+        set_fields["updated_at"] = now_update
         await get_db().sent_notifications.update_one(
             {"chat_id": clean_chat_id, "message_id": int(message_id)},
-            {"$setOnInsert": doc, "$set": {"updated_at": datetime.now(timezone.utc)}},
+            {
+                "$set": set_fields,
+                "$setOnInsert": {"created_at": doc["created_at"], "deleted": False},
+            },
             upsert=True,
         )
     except Exception:
-        pass
+        logger.warning("Could not store sent notification chat=%s message=%s", clean_chat_id, message_id, exc_info=True)
 
 
 def get_db():
@@ -531,7 +539,7 @@ def get_db():
         _client = AsyncIOMotorClient(
             MONGO_URI,
             tls=True,
-            tlsAllowInvalidCertificates=True,  # Fixes SSL handshake on Python 3.13
+            tlsAllowInvalidCertificates=MONGO_TLS_ALLOW_INVALID_CERTIFICATES,
             serverSelectionTimeoutMS=30000,
         )
         _db = _client[DB_NAME]

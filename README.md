@@ -71,42 +71,15 @@ python bot.py
 
 ---
 
-## 🛠 Admin Commands
+## 🛠 Admin Access
 
-| Command | Description |
-|---|---|
-| WebAdmin only | Telegram admin commands removed. Use the website admin panel. |
-| `/addproduct <name> <price_inr> <price_usdt>` | Add a new product |
-| `/removeproduct <name>` | Remove a product |
-| `/setprice <name> <price_inr> <price_usdt>` | Update product prices |
-| `/addstock <name>` | Start bulk stock addition |
-| `/removestock <name>` | Remove specific stock items |
-| `/cancel` | Abort active stock add/remove session |
-| `/clearstock <name>` | Wipe all stock for a product |
-| `/disableproduct <name>` | Hide a product from `/shop` without deleting it |
-| `/enableproduct <name>` | Show a disabled product in `/shop` again |
-| `/listproducts` | List products with stock counts, 10 per page |
-| `/listusers` | List all users with wallet balances, 10 per page |
-| `/pendingorders` | View paid orders waiting for stock |
-| `/findorder <order_id>` | Search one order and show full details |
-| `/stats` | Show overall bot users/orders/revenue/stock dashboard |
-| `/ranking` | Show top buyers, 10 per page with Next/Previous buttons |
-| `/userstats <user_id>` | Show wallet and order stats for one user |
-| `/userorders <user_id>` | Show a specific user’s orders, 10 per page, with `/getorderORDERID` shortcuts |
-| `/userwallethistory <user_id>` | Show a specific user’s wallet top-up logs with Payment Method and status, 10 per page |
-| `/maintenance <on\|off\|status>` | Turn maintenance mode on/off or check status |
-| `/addbalance <user_id> <inr\|usdt> <amount> [note]` | Add wallet balance for a user manually |
-| `/removebalance <user_id> <inr\|usdt> <amount> [note]` | Remove wallet balance from a user manually |
-| `/blockuser <user_id>` | Block a user |
-| `/unblockuser <user_id>` | Unblock a user |
-| `/broadcast <message>` | Send a message to all users |
-| `/recentorders` | View recent orders, 10 per page with Previous/Next buttons |
+Telegram admin commands were removed intentionally. Use the WebAdmin website for product, stock, order, payment, user, broadcast, replacement, ranking, maintenance, wallet-adjustment, and secret-management tasks.
 
 ---
 
 ## 🏆 Buyer Ranking
 
-Admins can use `/ranking` to see top buyers, 10 users per page with Previous/Next buttons.
+Owners can use WebAdmin → Ranking to see top buyers, 10 users per page with Previous/Next buttons.
 
 Each ranking entry shows:
 
@@ -139,7 +112,7 @@ Fetch again: /getorderAB12CD34
 
 The `/getorderORDERID` shortcut is handled by the bot but is not shown as a public command in BotFather. Users can tap it from the `/orders` message to receive their delivered items again.
 
-For admins, `/recentorders` shows all recent bot orders in a clean multi-line layout, 10 per page, with Previous/Next buttons. Each order includes a `/getorderORDERID` shortcut so admin can fetch delivered stock/items when needed. `/orders` and the My Orders button always show the admin's own personal order history.
+Admins can review recent orders and resend delivered items from WebAdmin. `/orders` and the My Orders button always show a Telegram user's own personal order history.
 
 ---
 
@@ -151,9 +124,9 @@ If payment is confirmed but the product has no stock left, the order is not fail
 Paid — Waiting for Stock
 ```
 
-The user receives a message with their Order ID and a Contact Support button. When admin later adds stock with `/addstock ProductName`, the bot automatically delivers waiting paid orders first, oldest first, before the stock is available for new buyers.
+The user receives a message with their Order ID and a Contact Support button. When an admin later adds stock from WebAdmin, the bot automatically delivers waiting paid orders first, oldest first, before the stock is available for new buyers.
 
-Admin's `/addstock` reply shows how many pending orders were auto-delivered and how much stock remains available for new buyers.
+WebAdmin shows how many pending orders were auto-delivered and how much stock remains available for new buyers.
 
 ---
 
@@ -170,7 +143,7 @@ Product buttons in `/shop` now show live stock count directly, for example:
 
 ## 📦 Adding Bulk Stock
 
-After `/addstock ProductName`, send your stock separated by `---`. Send `/cancel` to abort before uploading.
+In WebAdmin product/stock management, upload or paste stock separated by `---`.
 Each block between `---` = **one unit of stock**.
 
 **Single-line items:**
@@ -207,27 +180,11 @@ https://somelink.com/abc
 ---
 
 
-## 🧰 Admin Tools Added
+## 🧰 WebAdmin Tools
 
-### Pending paid orders
+Use WebAdmin for pending paid orders, product visibility, order search/stats, buyer ranking, user management, wallet adjustments, broadcasts, maintenance mode, and stock management.
 
-Use `/pendingorders` to see orders that are already paid but waiting for stock. These orders are delivered oldest-first when `/addstock` is used.
-
-### Product visibility
-
-Use `/disableproduct ProductName` to hide a product from the shop without deleting stock or order history. Use `/enableproduct ProductName` to show it again.
-
-### Order search and stats
-
-- `/findorder ORDERID` shows one order with user, product, amount, status, and delivered items.
-- `/stats` shows total users, orders, revenue value, and stock. Revenue counts only delivered orders and paid orders waiting for stock, using the actual payment currency only.
-- `/userstats USER_ID` shows one user's wallet balances and order totals. Paid value uses only the actual payment currency for each order.
-- `/userorders USER_ID` shows that user's orders cleanly, 10 per page, with `/getorderORDERID` shortcuts. Admins can use `/getorderORDERID` to fetch delivered stock/items for any order.
-- `/userwallethistory USER_ID` shows that user's wallet top-up logs cleanly with Payment Method and status, 10 per page.
-
-### Maintenance mode
-
-Use `/maintenance on` to temporarily stop non-admin users from using the bot. Admin commands still work. Turn it off with `/maintenance off`.
+Paid waiting-for-stock orders are delivered oldest-first when stock is added through WebAdmin.
 
 ### Low stock alerts
 
@@ -324,8 +281,8 @@ Use a read-only Binance API key and do not enable withdrawals.
 
 ## 🔐 Security Notes
 
-- Bot token/admin/database values are in `.env`; payment method details are managed in WebAdmin → Payment Settings and stored in MongoDB. Never commit `.env`.
-- Admin commands are restricted to the comma-separated IDs in `ADMIN_IDS`
+- `MONGO_URI`/`DB_NAME` live in environment variables. Bot token, admin accounts/IDs, payment settings, and other secrets are managed in WebAdmin and stored in MongoDB. Never commit `.env`.
+- Admin access is controlled from WebAdmin Secret Settings/admin accounts.
 - USDT auto-verification requires the exact unique amount shown to the user
 - Manual payment methods require screenshot proof before admin approval
 - Blocked users cannot interact with the bot at all
