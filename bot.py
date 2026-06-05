@@ -432,6 +432,21 @@ def _clear_user_input_flows(user_id: int | str | None, *, include_payment_manual
         clear_payment_manual_flows(user_id)
 
 
+_COMMANDS_THAT_START_A_NEW_FLOW = {
+    "start", "commands", "support", "shop", "wallet", "loadwallet",
+    "wallethistory", "orders", "replacements", "favorites",
+    "report", "language", "getorder", "getid",
+}
+
+
+def _command_name_from_text(text: str | None) -> str:
+    """Return the Telegram command name without slash, bot username, or args."""
+    token = str(text or "").strip().split(maxsplit=1)[0]
+    if not token.startswith("/"):
+        return ""
+    return token[1:].split("@", 1)[0].lower()
+
+
 async def clear_input_flows_on_new_command_or_navigation(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Cancel the previous waiting flow when the user starts another command.
 
@@ -444,7 +459,16 @@ async def clear_input_flows_on_new_command_or_navigation(update: Update, context
         return
 
     if update.message and update.message.text and update.message.text.strip().startswith("/"):
-        _clear_user_input_flows(user.id, include_payment_manual=True)
+        command_name = _command_name_from_text(update.message.text)
+        # Do not silently cancel Manual USDT verification for typo/unknown
+        # commands such as /txid. Keep the manual-payment state alive so the
+        # normal input handler can reply with the proper "send a valid TxID"
+        # message. Real bot/navigation commands still reset all active flows.
+        keep_manual_payment_flow = (
+            command_name not in _COMMANDS_THAT_START_A_NEW_FLOW
+            and is_payment_manual_input_active(user.id)
+        )
+        _clear_user_input_flows(user.id, include_payment_manual=not keep_manual_payment_flow)
         return
 
     if update.callback_query:
@@ -780,7 +804,10 @@ def main():
 
     # ── Message handlers ──
     app.add_handler(MessageHandler(filters.TEXT & filters.Regex(r"^/(getorder|getid)"), handle_get_order_lookup))
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
+    # Keep this as filters.TEXT (not "~filters.COMMAND") so typo/unknown
+    # commands typed inside an active input flow, for example /txid during
+    # Manual USDT Verification, are validated and answered instead of ignored.
+    app.add_handler(MessageHandler(filters.TEXT, handle_text))
     app.add_handler(MessageHandler(filters.PHOTO, handle_photo))
 
     logger.info("🚀 Starting bot...")
