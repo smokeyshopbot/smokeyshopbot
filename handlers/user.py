@@ -13,13 +13,19 @@ Flow:
 """
 
 import logging
+import html
+import re
+from bson import ObjectId
 import uuid
 import io
 from datetime import datetime, timezone
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import ContextTypes
+from telegram.error import BadRequest
+from telegram.helpers import escape_markdown
 
 import database as db
+from utils.product_emojis import label as product_emoji_label, prefix as product_emoji_prefix, normal_prefix, product_heading
 from config import SUPPORT_USERNAMES
 from utils.crypto import UniqueUsdtAmountUnavailable, generate_unique_usdt_amount
 from utils.messages import commands_text, compact_blank_lines, md_code, telegram_id, order_amount_text
@@ -207,7 +213,7 @@ def _product_description_block(product: dict, lang: str = "en") -> str:
         description = str(product.get("description_en") or product.get("description") or "").strip()
     if not description:
         return ""
-    return tr(selected_lang, "product_description_block", description=description)
+    return tr(selected_lang, "product_description_block", description=html.escape(description, quote=False))
 
 
 def _product_warranty_block(product: dict, lang: str = "en") -> str:
@@ -246,7 +252,7 @@ def _fit_product_button(prefix: str, name: str, stock_part: str, price_part: str
     shown after the user opens the product.
     """
     name = str(name or "Product").strip()
-    return f"{prefix} {name} | {stock_part} | {price_part}"
+    return f"{normal_prefix(prefix + chr(32))}{name} | {stock_part} | {price_part}"
 
 
 def _product_callback(prefix: str, product: dict) -> str:
@@ -336,6 +342,9 @@ def _product_button_label(product: dict, payment_settings: dict | None = None, l
     if not enabled:
         prefix = "🚫"
         stock_part = tr(lang, "stock_disabled")
+    elif stock_count <= 0 and product.get("external_supplier_available"):
+        prefix = "✅"
+        stock_part = "API stock"
     elif stock_count <= 0:
         if db.product_preorder_enabled(product):
             capacity = int(product.get("preorder_capacity_remaining", 0) or 0)
@@ -351,7 +360,7 @@ def _product_button_label(product: dict, payment_settings: dict | None = None, l
     else:
         prefix = "✅"
         stock_part = tr(lang, "stock_count", count=stock_count)
-    return _fit_product_button(prefix, product['name'], stock_part, _price_label(product, payment_settings, lang=lang))
+    return product_emoji_prefix(product) + _fit_product_button(prefix, product['name'], stock_part, _price_label(product, payment_settings, lang=lang))
 
 
 def _main_menu_keyboard(user_id: int, lang: str = "en") -> InlineKeyboardMarkup:
@@ -367,7 +376,9 @@ def _main_menu_keyboard(user_id: int, lang: str = "en") -> InlineKeyboardMarkup:
             InlineKeyboardButton(tr(lang, "btn_replacements"), callback_data="nav:replacements"),
         ],
         [InlineKeyboardButton(tr(lang, "btn_favorites"), callback_data="nav:favorites")],
+        [InlineKeyboardButton(tr(lang, "btn_search"), callback_data="nav:search")],
         [InlineKeyboardButton(tr(lang, "btn_report"), callback_data="nav:report")],
+        [InlineKeyboardButton(tr(lang, "btn_api"), callback_data="nav:api")],
         [InlineKeyboardButton(tr(lang, "btn_commands"), callback_data="nav:commands")],
         [InlineKeyboardButton(tr(lang, "btn_language"), callback_data="nav:language")],
         [InlineKeyboardButton(tr(lang, "btn_support"), callback_data="nav:support")],
@@ -389,6 +400,7 @@ def _product_list_keyboard(products: list[dict], payment_settings: dict | None =
         for p in products
     ]
     if include_back:
+        buttons.append([InlineKeyboardButton(tr(lang, "btn_search"), callback_data="nav:search")])
         buttons.append(_back_button(lang))
     return InlineKeyboardMarkup(buttons)
 
@@ -406,12 +418,14 @@ def _product_buy_keyboard(back_to: str = "shop", lang: str = "en") -> InlineKeyb
 def _favorite_button_label(product: dict, payment_settings: dict | None = None, is_favorite: bool = False, lang: str = "en") -> str:
     star = "⭐" if is_favorite else "☆"
     stock_count = int(product.get("available_stock", len(product.get("stock", []) or [])) or 0)
-    if stock_count <= 0 and db.product_preorder_enabled(product):
+    if stock_count <= 0 and product.get("external_supplier_available"):
+        stock_part = "API stock"
+    elif stock_count <= 0 and db.product_preorder_enabled(product):
         capacity = int(product.get("preorder_capacity_remaining", 0) or 0)
         stock_part = tr(lang, "stock_preorder_open", remaining=capacity) if capacity > 0 else tr(lang, "stock_preorder_full")
     else:
         stock_part = tr(lang, "stock_sold_out") if stock_count <= 0 else tr(lang, "stock_count", count=stock_count)
-    return _fit_product_button(star, product['name'], stock_part, _price_label(product, payment_settings or {}, lang=lang))
+    return product_emoji_prefix(product) + _fit_product_button(star, product['name'], stock_part, _price_label(product, payment_settings or {}, lang=lang))
 
 
 def _favorite_name_set(favorite_names: list[str] | None) -> set[str]:
@@ -567,7 +581,7 @@ def _status_emoji(status: str) -> str:
 
 def _status_label(status: str, lang: str = "en") -> str:
     if (status or "").lower() == "revoked":
-        return "Revoked"
+        return tr(lang, "status_revoked")
     key = {
         "pending_stock": "status_pending_stock",
         "pending": "status_pending",
@@ -623,7 +637,7 @@ def _format_user_orders_text(orders: list[dict], page: int = 0, total_count: int
             f"{tr(lang, 'payment_method')}: `{str(order.get('payment_method', 'N/A')).upper()}`",
             f"{tr(lang, 'product')}: *{order.get('product_name', 'N/A')}* x{order.get('quantity', 0)}",
             f"{tr(lang, 'status')}: {_status_emoji(display_status)} {_status_label(display_status, lang)}",
-            f"{tr(lang, 'fetch_again')}: {'Disabled by admin' if order.get('delivery_revoked') else _getorder_shortcut(order_id)}",
+            f"{tr(lang, 'fetch_again')}: {tr(lang, 'delivery_disabled_by_admin') if order.get('delivery_revoked') else _getorder_shortcut(order_id)}",
             "",
         ])
     return compact_blank_lines("\n".join(lines))
@@ -879,7 +893,7 @@ def _format_user_replacements_text(replacements: list[dict], page: int = 0, tota
             f"{tr(lang, 'product')}: *{order.get('product_name', 'N/A')}* x{order.get('quantity', 0)}",
             f"{tr(lang, 'original_order')}: `{original_orders}`",
             f"{tr(lang, 'status')}: {_status_emoji(display_status)} {_status_label(display_status, lang)}",
-            f"{tr(lang, 'fetch_again')}: {'Disabled by admin' if order.get('delivery_revoked') else _getorder_shortcut(order_id)}",
+            f"{tr(lang, 'fetch_again')}: {tr(lang, 'delivery_disabled_by_admin') if order.get('delivery_revoked') else _getorder_shortcut(order_id)}",
             "",
         ])
     return compact_blank_lines("\n".join(lines))
@@ -903,27 +917,68 @@ def _replacements_keyboard(page: int = 0, total_count: int = 0, lang: str = "en"
 
 
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    args = context.args or []
+    if args and re.fullmatch(r'product_[a-fA-F0-9]{24}', args[0]):
+        context.user_data['pending_product_link'] = args[0][8:].lower()
+    if args and re.fullmatch(r'poll_[A-F0-9]{12}', args[0]):
+        context.user_data['pending_poll_link'] = args[0][5:]
+    await show_start(update, context)
+
+
+async def show_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Shared onboarding/menu entry for /start and successful channel verification."""
     user = update.effective_user
     saved_user = await db.upsert_user(user.id, user.username or "")
 
     if await db.is_blocked(user.id):
-        await update.message.reply_text(tr(await _user_lang(user.id), "blocked"))
+        await _send_start_text(update, tr(await _user_lang(user.id), "blocked"))
         return
 
     if not saved_user.get("language_selected"):
-        await update.message.reply_text(
-            _language_prompt("en"),
+        enabled = await db.get_enabled_languages()
+        lang = normalize_lang(str(saved_user.get("language") or user.language_code or "en").split("-", 1)[0])
+        if lang not in enabled:
+            lang = "en"
+        await _send_start_text(
+            update, _language_prompt(lang),
             parse_mode="Markdown",
-            reply_markup=_language_keyboard(await db.get_enabled_languages()),
+            reply_markup=_language_keyboard(enabled),
         )
         return
 
     lang = await _user_lang(user.id)
-    await update.message.reply_text(
-        _main_menu_text(user.first_name, lang),
+    pending_poll = context.user_data.pop('pending_poll_link', None)
+    if pending_poll:
+        from handlers.polls import open_private_survey
+        await open_private_survey(update, context, pending_poll)
+        return
+    pending_product = context.user_data.pop('pending_product_link', None)
+    if pending_product:
+        product = await db.get_db().products.find_one({'_id': ObjectId(pending_product)})
+        if not product:
+            await _send_start_text(update, tr(lang, 'product_not_found'))
+            return
+        from types import SimpleNamespace
+        async def edit(text, **kwargs):
+            await _send_start_text(update, text, **kwargs)
+        await _show_quantity_prompt(SimpleNamespace(edit_message_text=edit), user.id, product['name'])
+        return
+    await _send_start_text(
+        update, _main_menu_text(user.first_name, lang),
         parse_mode="Markdown",
         reply_markup=_main_menu_keyboard(user.id, lang)
     )
+
+
+async def _send_start_text(update, text, **kwargs):
+    if update.callback_query:
+        try:
+            await update.callback_query.edit_message_text(text, **kwargs)
+            return
+        except BadRequest as error:
+            if "message is not modified" in str(error).lower():
+                return
+    await update.effective_message.reply_text(text, **kwargs)
 
 
 async def cmd_language(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -951,6 +1006,9 @@ async def handle_language_select(update: Update, context: ContextTypes.DEFAULT_T
     await db.upsert_user(user_id, query.from_user.username or "")
     await db.set_user_language(user_id, lang)
     await query.answer(tr(lang, "language_changed"), show_alert=False)
+    if context.user_data.get('pending_product_link') or context.user_data.get('pending_poll_link'):
+        await show_start(update, context)
+        return
     await query.edit_message_text(
         _main_menu_text(query.from_user.first_name, lang),
         parse_mode="Markdown",
@@ -1074,6 +1132,84 @@ async def cmd_replacements(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
 
+def _api_link_text(api_key: str | None, summary: dict | None = None, lang: str = "en") -> str:
+    summary = summary or {}
+    if summary.get("disabled"): return tr(lang, "api_disabled")
+    lines = [tr(lang, "api_title"), "", tr(lang, "api_intro"), ""]
+    if api_key:
+        lines.extend([tr(lang, "api_your_key"), md_code(api_key), "", tr(lang, "api_key_again")])
+    elif summary.get("enabled"):
+        lines.extend([tr(lang, "api_key_active"), tr(lang, "api_key_prefix", prefix=md_code(summary.get("prefix") or "—")), "", tr(lang, "api_legacy_key")])
+    else: lines.append(tr(lang, "api_no_key"))
+    lines.extend(["", md_code("Authorization: Bearer YOUR_KEY"), "", tr(lang, "api_endpoints"),
+        md_code("GET /api/telegram-buyer/products"), md_code("GET /api/telegram-buyer/balance"),
+        md_code("POST /api/telegram-buyer/purchase"), md_code("GET /api/telegram-buyer/orders/ORDER_ID"), "", tr(lang, "api_instructions")])
+    return "\n".join(lines)
+
+
+def _api_link_keyboard(summary: dict | None = None, lang: str = "en") -> InlineKeyboardMarkup:
+    summary = summary or {}
+    if summary.get("disabled"):
+        return InlineKeyboardMarkup([_back_button(lang)])
+    label = tr(lang, "api_regenerate" if summary.get("enabled") else "api_generate")
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton(label, callback_data="api:regenerate")],
+        [InlineKeyboardButton(tr(lang, 'api_catalog_button'), callback_data='api_catalog:open')],
+        _back_button(lang),
+    ])
+
+
+async def cmd_api(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not update.effective_chat or update.effective_chat.type != "private":
+        await update.effective_message.reply_text(tr(await _user_lang(update.effective_user.id) if update.effective_user else "en", "api_private"))
+        return
+    user = update.effective_user
+    if not user:
+        return
+    await db.upsert_user(user.id, user.username or "")
+    if await db.is_blocked(user.id):
+        await update.message.reply_text(tr(await _user_lang(user.id), "blocked"))
+        return
+    api_key, _user_doc = await db.ensure_user_api_key(user.id, user.username or "")
+    summary = await db.get_user_api_summary(user.id)
+    await update.message.reply_text(
+        _api_link_text(api_key, summary, await _user_lang(update.effective_user.id)),
+        parse_mode="Markdown",
+        reply_markup=_api_link_keyboard(summary, await _user_lang(user.id)),
+    )
+
+
+async def handle_api_callbacks(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    if not query or not query.from_user:
+        return
+    await query.answer()
+    user_id = query.from_user.id
+    await db.upsert_user(user_id, query.from_user.username or "")
+    if await db.is_blocked(user_id):
+        await query.edit_message_text(tr(await _user_lang(user_id), "blocked"))
+        return
+    if not query.message or query.message.chat.type != "private":
+        return
+    summary = await db.get_user_api_summary(user_id)
+    if summary.get("disabled"):
+        await query.edit_message_text(_api_link_text(None, summary, await _user_lang(user_id)))
+        return
+    action = (query.data or "").split(":", 1)[-1]
+    if action == "regenerate":
+        try:
+            api_key = await db.rotate_user_api_key(user_id, query.from_user.username or "")
+        except PermissionError:
+            await query.edit_message_text(tr(await _user_lang(user_id), "api_disabled"))
+            return
+        summary = await db.get_user_api_summary(user_id)
+        await query.edit_message_text(
+            _api_link_text(api_key, summary, await _user_lang(update.effective_user.id)),
+            parse_mode="Markdown",
+            reply_markup=_api_link_keyboard(summary, await _user_lang(user_id)),
+        )
+
+
 async def handle_get_order_lookup(update: Update, context: ContextTypes.DEFAULT_TYPE) -> bool:
     """Handles tappable /getorderORDERID shortcuts without listing it as a public command."""
     user_id = update.effective_user.id
@@ -1110,7 +1246,7 @@ async def handle_get_order_lookup(update: Update, context: ContextTypes.DEFAULT_
         return True
 
     if order.get("delivery_revoked"):
-        await update.message.reply_text("🚫 This delivery was revoked by admin, so it can no longer be fetched from the bot.")
+        await update.message.reply_text(tr(lang, "delivery_revoked_message"))
         return True
 
     if order.get("status") == "delivered" and (order.get("items") or []):
@@ -1286,6 +1422,21 @@ async def handle_nav_buttons(update: Update, context: ContextTypes.DEFAULT_TYPE)
         await start_report_from_query(update, context)
         return
 
+    if base_action == "api":
+        if not query.message or query.message.chat.type != "private":
+            await query.edit_message_text(tr(await _user_lang(update.effective_user.id) if update.effective_user else "en", "api_private"))
+            return
+        _shop_flow.pop(user_id, None)
+        _clear_wallet_flow_if_available(user_id)
+        api_key, _user_doc = await db.ensure_user_api_key(user_id, query.from_user.username or "")
+        summary = await db.get_user_api_summary(user_id)
+        await query.edit_message_text(
+            _api_link_text(api_key, summary, await _user_lang(update.effective_user.id)),
+            parse_mode="Markdown",
+            reply_markup=_api_link_keyboard(summary, lang),
+        )
+        return
+
     if base_action == "commands":
         await query.edit_message_text(
             commands_text(lang),
@@ -1335,11 +1486,12 @@ async def _show_quantity_prompt(query, user_id: int, product_name: str, *, back_
         )
         return
 
+    display_product = escape_markdown(product_emoji_label(product, product.get("name") or product_name), version=1)
     back_keyboard = _product_buy_keyboard(back_to, lang)
 
     if product.get("enabled", True) is False:
         await query.edit_message_text(
-            tr(lang, "product_unavailable", product=product_name),
+            tr(lang, "product_unavailable", product=display_product),
             parse_mode="Markdown",
             reply_markup=back_keyboard
         )
@@ -1360,7 +1512,9 @@ async def _show_quantity_prompt(query, user_id: int, product_name: str, *, back_
         )
         return
 
-    stock_count = await db.get_available_stock_count(product_name)
+    external_supplier_available = bool(product.get("external_supplier_available")) or await db.product_has_external_supplier_fallback(product)
+    stock_count = (await db.get_combined_available_stock_count(product) if external_supplier_available
+                   else await db.get_available_stock_count(product_name))
     is_preorder = False
     preorder_capacity = 0
     preorder_max_qty = 0
@@ -1376,7 +1530,7 @@ async def _show_quantity_prompt(query, user_id: int, product_name: str, *, back_
 
         if not db.product_preorder_enabled(product):
             await query.edit_message_text(
-                tr(lang, "product_out_stock", product=product_name),
+                tr(lang, "product_out_stock", product=display_product),
                 parse_mode="Markdown",
                 reply_markup=back_keyboard
             )
@@ -1384,7 +1538,7 @@ async def _show_quantity_prompt(query, user_id: int, product_name: str, *, back_
 
         if user_remaining < min_qty_for_product and preorder_capacity >= min_qty_for_product:
             await query.edit_message_text(
-                tr(lang, "preorder_user_limit_reached", product=product_name, active=user_active_qty, limit=user_limit),
+                tr(lang, "preorder_user_limit_reached", product=display_product, active=user_active_qty, limit=user_limit),
                 parse_mode="Markdown",
                 reply_markup=back_keyboard
             )
@@ -1392,7 +1546,7 @@ async def _show_quantity_prompt(query, user_id: int, product_name: str, *, back_
 
         if preorder_capacity < min_qty_for_product or preorder_max_qty < min_qty_for_product:
             await query.edit_message_text(
-                tr(lang, "preorder_full", product=product_name),
+                tr(lang, "preorder_full", product=display_product),
                 parse_mode="Markdown",
                 reply_markup=back_keyboard
             )
@@ -1403,7 +1557,7 @@ async def _show_quantity_prompt(query, user_id: int, product_name: str, *, back_
         min_qty, max_qty = _get_order_quantity_limits(product, stock_count)
         if stock_count < min_qty:
             await query.edit_message_text(
-                tr(lang, "product_not_enough_stock", product=product_name),
+                tr(lang, "product_not_enough_stock", product=display_product),
                 parse_mode="Markdown",
                 reply_markup=back_keyboard
             )
@@ -1412,27 +1566,27 @@ async def _show_quantity_prompt(query, user_id: int, product_name: str, *, back_
     if is_preorder:
         _shop_flow[user_id] = {"step": "quantity", "product": product, "is_preorder": True}
         await query.edit_message_text(
-            compact_blank_lines(tr(
+            compact_blank_lines(product_heading(tr(
                 lang,
                 "preorder_quantity_prompt",
-                product=product['name'],
+                product=html.escape(product_emoji_label(product), quote=False),
                 description=_product_details_block(product, lang),
-                price=_price_label(product, payment_settings, lang=lang),
+                price=html.escape(_price_label(product, payment_settings, lang=lang), quote=False),
                 remaining=preorder_capacity,
                 user_remaining=user_remaining,
                 user_limit=user_limit,
                 active=user_active_qty,
                 max_qty=preorder_max_qty,
-            )),
-            parse_mode="Markdown",
+            ))),
+            parse_mode="HTML",
             reply_markup=back_keyboard
         )
         return
 
     _shop_flow[user_id] = {"step": "quantity", "product": product}
     await query.edit_message_text(
-        compact_blank_lines(tr(lang, "quantity_prompt", product=product['name'], description=_product_details_block(product, lang), price=_price_label(product, payment_settings, lang=lang), stock=stock_count)),
-        parse_mode="Markdown",
+        compact_blank_lines(product_heading(tr(lang, "quantity_prompt", product=html.escape(product_emoji_label(product), quote=False), description=_product_details_block(product, lang), price=html.escape(_price_label(product, payment_settings, lang=lang), quote=False), stock=stock_count))),
+        parse_mode="HTML",
         reply_markup=back_keyboard
     )
 
@@ -1480,7 +1634,9 @@ async def handle_quantity_input(update: Update, context: ContextTypes.DEFAULT_TY
         await update.message.reply_text(tr(lang, "enter_valid_number"))
         return True
 
-    stock_count = await db.get_available_stock_count(product["name"])
+    external_supplier_available = bool(product.get("external_supplier_available")) or await db.product_has_external_supplier_fallback(product)
+    stock_count = (await db.get_combined_available_stock_count(product) if external_supplier_available
+                   else await db.get_available_stock_count(product["name"]))
     is_preorder = bool(state.get("is_preorder"))
     if is_preorder:
         min_qty, product_max_qty = _get_order_quantity_limits(product, None)
@@ -1582,7 +1738,7 @@ async def handle_quantity_input(update: Update, context: ContextTypes.DEFAULT_TY
 
     summary_key = "preorder_order_summary" if is_preorder else "order_summary"
     await update.message.reply_text(
-        tr(lang, summary_key, product=product['name'], quantity=qty, total=_price_label(product, payment_settings, quantity=qty, lang=lang)),
+        tr(lang, summary_key, product=product_emoji_label(product), quantity=qty, total=_price_label(product, payment_settings, quantity=qty, lang=lang)),
         parse_mode="Markdown",
         reply_markup=InlineKeyboardMarkup(buttons)
     )
@@ -1719,7 +1875,9 @@ async def handle_payment_method_select(update: Update, context: ContextTypes.DEF
     product = await db.get_effective_product_for_user(latest_product, user_id) or latest_product
     qty = state["quantity"]
     is_preorder = bool(state.get("is_preorder"))
-    stock_count = await db.get_available_stock_count(product["name"])
+    external_supplier_available = bool(product.get("external_supplier_available")) or await db.product_has_external_supplier_fallback(product)
+    stock_count = (await db.get_combined_available_stock_count(product) if external_supplier_available
+                   else await db.get_available_stock_count(product["name"]))
     if is_preorder:
         min_qty, product_max_qty = _get_order_quantity_limits(product, None)
         status = await _preorder_status_for_user(product, user_id)
@@ -1770,11 +1928,14 @@ async def handle_payment_method_select(update: Update, context: ContextTypes.DEF
         order_id = await _create_checkout_order(context, user_id, query.from_user.username or "", product, qty, "wallet_inr", total_inr, 0, is_preorder, lang)
         if not order_id:
             return
-        success = await db.deduct_wallet_inr(user_id, total_inr)
+        from utils.wallet_audit import event_id
+        await db.get_db().orders.update_one({"order_id": order_id}, {"$set": {"wallet_event_id": event_id(user_id, "inr", "order-" + order_id), "wallet_event_delta": -total_inr}})
+        success = await db.deduct_wallet_inr(user_id, total_inr, reference="order-" + order_id)
         if not success:
             await db.update_order_status(order_id, "cancelled")
             await context.bot.send_message(user_id, tr(lang, "wallet_insufficient_inr"))
             return
+        await db.get_db().orders.update_one({"order_id": order_id}, {"$set": {"wallet_charge_applied_at": datetime.now(timezone.utc)}})
         await _finalize_wallet_order_after_charge(context, user_id, order_id)
         return
 
@@ -1782,11 +1943,14 @@ async def handle_payment_method_select(update: Update, context: ContextTypes.DEF
         order_id = await _create_checkout_order(context, user_id, query.from_user.username or "", product, qty, "wallet_usdt", 0, total_usdt, is_preorder, lang)
         if not order_id:
             return
-        success = await db.deduct_wallet_usdt(user_id, total_usdt)
+        from utils.wallet_audit import event_id
+        await db.get_db().orders.update_one({"order_id": order_id}, {"$set": {"wallet_event_id": event_id(user_id, "usdt", "order-" + order_id), "wallet_event_delta": -total_usdt}})
+        success = await db.deduct_wallet_usdt(user_id, total_usdt, reference="order-" + order_id)
         if not success:
             await db.update_order_status(order_id, "cancelled")
             await context.bot.send_message(user_id, tr(lang, "wallet_insufficient_usdt"))
             return
+        await db.get_db().orders.update_one({"order_id": order_id}, {"$set": {"wallet_charge_applied_at": datetime.now(timezone.utc)}})
         await _finalize_wallet_order_after_charge(context, user_id, order_id)
         return
 

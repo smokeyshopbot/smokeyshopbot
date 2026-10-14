@@ -11,6 +11,7 @@ from telegram.ext import ContextTypes
 from telegram import Update
 
 import database as db
+from utils.data_guard import guarded_async
 from utils.i18n import tr
 from config import (
     SUPPORT_USERNAMES, PAYMENT_TIMEOUT_MINUTES, PAYMENT_REMINDER_MINUTES, USDT_VERIFY_INTERVAL, LOW_STOCK_ALERT_THRESHOLD,
@@ -1512,6 +1513,7 @@ async def notify_low_stock_if_needed(bot, product_name: str):
         pass
 
 
+@guarded_async(lambda: db.get_db())
 async def complete_order(bot, user_id: int, ref_id: str):
     # Claim the order before touching stock. The same paid order can be reached
     # by the background auto-checker, Check Payment button, startup recovery, or
@@ -1560,10 +1562,12 @@ async def complete_order(bot, user_id: int, ref_id: str):
             )
             return
 
+    fulfillment = {"items": [], "source": "none"}
     try:
-        items = await db.pop_stock(product_name, quantity)
+        fulfillment = await db.fulfill_product_items(product_name, quantity, order_id=ref_id)
+        items = fulfillment.get("items") or []
     except Exception as exc:
-        logger.exception("Could not pop stock for paid order %s: %s", ref_id, exc)
+        logger.exception("Could not fulfill paid order %s: %s", ref_id, exc)
         await db.mark_order_pending_stock(ref_id, delivery_token=delivery_token)
         order["status"] = "pending_stock"
         await _delete_payment_msg_by_bot(bot, ref_id)
@@ -1595,12 +1599,13 @@ async def complete_order(bot, user_id: int, ref_id: str):
         # send stock to the user if we could not attach those items to the order.
         logger.error("Could not finalize delivered order after stock pop ref=%s items=%s", ref_id, len(items))
         try:
-            await db.restore_popped_stock_items(
-                product_name,
-                items,
-                source="telegram_bot",
-                note=f"Restored because paid order {ref_id} could not be finalized",
-            )
+            if fulfillment.get("source") == "local_stock":
+                await db.restore_popped_stock_items(
+                    product_name,
+                    items,
+                    source="telegram_bot",
+                    note=f"Restored because paid order {ref_id} could not be finalized",
+                )
             await db.clear_order_delivery_lock(ref_id, delivery_token=delivery_token)
         except Exception:
             logger.exception("Could not restore stock after delivery finalization failure ref=%s", ref_id)
@@ -1614,6 +1619,7 @@ async def complete_order(bot, user_id: int, ref_id: str):
         except Exception:
             pass
         return
+    await db.attach_order_supplier_info(ref_id, fulfillment)
 
     if _is_admin_created_order(order) and not was_pending_stock:
         await _send_admin_created_order_created_notice(bot, user_id, order)
@@ -1629,6 +1635,7 @@ async def complete_order(bot, user_id: int, ref_id: str):
     except Exception as exc:
         logger.exception("Could not drain pending-stock queue after delivering %s: %s", ref_id, exc)
 
+@guarded_async(lambda: db.get_db())
 async def recover_stuck_wallet_orders(bot, limit: int = 100) -> dict:
     """Finalize wallet-paid orders that accidentally stayed plain pending.
 
@@ -1680,6 +1687,7 @@ async def recover_stuck_wallet_orders(bot, limit: int = 100) -> dict:
     return {"checked": len(stuck_orders), "finalized": finalized, "still_pending": still_pending}
 
 
+@guarded_async(lambda: db.get_db())
 async def process_pending_stock_orders(bot, product_name: str, *, limit: int = 100, max_passes: int = 3) -> dict:
     """Deliver paid pending-stock orders for a product, oldest first.
 
@@ -1714,7 +1722,10 @@ async def process_pending_stock_orders(bot, product_name: str, *, limit: int = 1
             order_id = order.get("order_id")
             qty = int(order.get("quantity", 1) or 1)
             stock_now = await db.get_stock_count(product_name)
+            supplier_stock = 0
             if stock_now < qty:
+                supplier_stock = await db.get_external_supplier_available_stock(product_name)
+            if stock_now + supplier_stock < qty:
                 blocked_by_stock += 1
                 stop_pass = True
                 break
@@ -1729,9 +1740,11 @@ async def process_pending_stock_orders(bot, product_name: str, *, limit: int = 1
                 break
             delivery_token = claimed.get("delivery_lock_token")
 
+            fulfillment = {"items": [], "source": "none"}
             items: list[str] = []
             try:
-                items = await db.pop_stock(product_name, qty)
+                fulfillment = await db.fulfill_product_items(product_name, qty, order_id=order_id)
+                items = fulfillment.get("items") or []
             except Exception as exc:
                 logger.exception("Could not pop stock for pending-stock order %s: %s", order_id, exc)
                 await db.mark_order_pending_stock(order_id, delivery_token=delivery_token)
@@ -1748,12 +1761,13 @@ async def process_pending_stock_orders(bot, product_name: str, *, limit: int = 1
             if not updated:
                 logger.error("Could not finalize pending-stock order after stock pop order=%s", order_id)
                 try:
-                    restored_items += await db.restore_popped_stock_items(
-                        product_name,
-                        items,
-                        source="telegram_bot",
-                        note=f"Restored because pending-stock order {order_id} could not be finalized",
-                    )
+                    if fulfillment.get("source") == "local_stock":
+                        restored_items += await db.restore_popped_stock_items(
+                            product_name,
+                            items,
+                            source="telegram_bot",
+                            note=f"Restored because pending-stock order {order_id} could not be finalized",
+                        )
                     await db.clear_order_delivery_lock(order_id, delivery_token=delivery_token)
                 except Exception:
                     logger.exception("Could not restore stock after pending-stock finalization failure order=%s", order_id)
@@ -1767,6 +1781,7 @@ async def process_pending_stock_orders(bot, product_name: str, *, limit: int = 1
                     pass
                 stop_pass = True
                 break
+            await db.attach_order_supplier_info(order_id, fulfillment)
 
             delivered_orders += 1
             pass_delivered += 1
@@ -1824,6 +1839,7 @@ async def _send_wallet_load_status(bot, user_id: int, pending: dict, *, already:
             parse_mode="Markdown"
         )
 
+@guarded_async(lambda: db.get_db())
 async def complete_wallet_load(bot, user_id: int, pending: dict):
     ref_id = pending.get("ref_id", "")
     credited_row = await db.mark_wallet_load_credited(ref_id)
@@ -1839,9 +1855,9 @@ async def complete_wallet_load(bot, user_id: int, pending: dict):
     load_amount = float(credited_row.get("load_amount", 0.0) or 0.0)
 
     if currency == "inr":
-        await db.add_wallet_inr(user_id, load_amount)
+        await db.add_wallet_inr(user_id, load_amount, reference="topup-" + ref_id)
     else:
-        await db.add_wallet_usdt(user_id, load_amount)
+        await db.add_wallet_usdt(user_id, load_amount, reference="topup-" + ref_id)
 
     await _delete_payment_msg_by_bot(bot, ref_id)
     await _send_wallet_load_status(bot, user_id, credited_row, already=False)

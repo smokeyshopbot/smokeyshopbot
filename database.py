@@ -13,8 +13,11 @@ from __future__ import annotations
 import logging
 import re
 import hashlib
+import secrets
 import time
 import uuid
+import asyncio
+import aiohttp
 from datetime import datetime, timezone, timedelta
 from typing import Optional, Any
 from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
@@ -25,6 +28,7 @@ from pymongo import ReturnDocument
 from pymongo.errors import DuplicateKeyError
 from bson import ObjectId
 from config import MONGO_URI, DB_NAME, MONGO_TLS_ALLOW_INVALID_CERTIFICATES, is_admin_id
+from utils.update_context import current_upserts, timed
 
 _client: Optional[AsyncIOMotorClient] = None
 _db = None
@@ -222,15 +226,20 @@ async def get_user_product_custom_prices(user_id: int) -> list[dict]:
 async def get_effective_product_for_user(product: dict | None, user_id: int) -> dict | None:
     if not product:
         return None
-    user = await get_user(user_id) or {"user_id": user_id, "pricing_group": DEFAULT_PRICE_GROUP}
+    seen = current_upserts()
+    user = dict(seen[user_id]) if seen is not None and user_id in seen else await get_user(user_id)
+    user = user or {"user_id": user_id, "pricing_group": DEFAULT_PRICE_GROUP}
     custom_price = await get_user_product_custom_price(user_id, str(product.get("name") or ""))
     return apply_effective_price_to_product(product, user, custom_price)
 
 
+@timed('pricing')
 async def apply_effective_prices_to_products_for_user(products: list[dict], user_id: int) -> list[dict]:
     if not products:
         return []
-    user = await get_user(user_id) or {"user_id": user_id, "pricing_group": DEFAULT_PRICE_GROUP}
+    seen = current_upserts()
+    user = dict(seen[user_id]) if seen is not None and user_id in seen else await get_user(user_id)
+    user = user or {"user_id": user_id, "pricing_group": DEFAULT_PRICE_GROUP}
     custom_map = _custom_price_map(await get_user_product_custom_prices(user_id))
     return [
         apply_effective_price_to_product(product, user, custom_map.get(_product_name_key(product.get("name"))))
@@ -533,6 +542,10 @@ async def record_sent_notification(
         logger.warning("Could not store sent notification chat=%s message=%s", clean_chat_id, message_id, exc_info=True)
 
 
+from utils.data_guard import AsyncGuardedDatabase
+from utils.wallet_audit import change_wallet_async, event_id
+
+
 def get_db():
     global _client, _db
     if _db is None:
@@ -542,7 +555,7 @@ def get_db():
             tlsAllowInvalidCertificates=MONGO_TLS_ALLOW_INVALID_CERTIFICATES,
             serverSelectionTimeoutMS=30000,
         )
-        _db = _client[DB_NAME]
+        _db = AsyncGuardedDatabase(_client[DB_NAME])
     return _db
 
 
@@ -784,13 +797,20 @@ async def get_user(user_id: int) -> Optional[dict]:
     return await get_db().users.find_one({"user_id": user_id})
 
 
+@timed('user_profile')
 async def upsert_user(user_id: int, username: str = "") -> dict:
+    seen = current_upserts()
+    if seen is not None and user_id in seen:
+        return dict(seen[user_id])
     db = get_db()
     username = (username or "").strip().lstrip("@")
     existing = await db.users.find_one({"user_id": user_id})
     now = datetime.now(timezone.utc)
     if existing:
-        set_updates: dict[str, Any] = {"last_user_interaction_at": now}
+        set_updates: dict[str, Any] = {}
+        last_seen = existing.get("last_user_interaction_at")
+        if not isinstance(last_seen, datetime) or not 0 <= (now - last_seen.replace(tzinfo=timezone.utc)).total_seconds() < 60:
+            set_updates["last_user_interaction_at"] = now
         unset_updates: dict[str, str] = {}
         if username and existing.get("username") != username:
             set_updates["username"] = username
@@ -817,8 +837,11 @@ async def upsert_user(user_id: int, username: str = "") -> dict:
         update_doc: dict[str, Any] = {"$set": set_updates}
         if unset_updates:
             update_doc["$unset"] = unset_updates
-        await db.users.update_one({"user_id": user_id}, update_doc)
+        if set_updates or unset_updates:
+            await db.users.update_one({"user_id": user_id}, update_doc)
         existing.update(set_updates)
+        if seen is not None:
+            seen[user_id] = dict(existing)
         return existing
     doc = {
         "user_id": user_id,
@@ -835,11 +858,14 @@ async def upsert_user(user_id: int, username: str = "") -> dict:
         "language_selected": False,
     }
     await db.users.insert_one(doc)
+    if seen is not None:
+        seen[user_id] = dict(doc)
     return doc
 
 
 async def is_blocked(user_id: int) -> bool:
-    user = await get_user(user_id)
+    seen = current_upserts()
+    user = seen.get(user_id) if seen is not None and user_id in seen else await get_user(user_id)
     return bool(user and user.get("blocked"))
 
 
@@ -853,10 +879,20 @@ def normalize_language(value: str | None) -> str:
 
 
 async def get_user_language(user_id: int, default: str = "en") -> str:
+    seen = current_upserts()
+    if seen is not None:
+        if user_id in seen:
+            profile = seen[user_id]
+            return normalize_language(profile.get('language') or profile.get('language_code') or default)
+        if ('language', user_id) in seen:
+            return seen[('language', user_id)]
     user = await get_user(user_id)
     if not user:
         return normalize_language(default)
-    return normalize_language(user.get("language") or user.get("language_code") or default)
+    language = normalize_language(user.get("language") or user.get("language_code") or default)
+    if seen is not None:
+        seen[('language', user_id)] = language
+    return language
 
 
 async def has_selected_language(user_id: int) -> bool:
@@ -871,6 +907,11 @@ async def set_user_language(user_id: int, language: str) -> str:
         {"user_id": user_id},
         {"$set": {"language": language, "language_selected": True, "language_updated_at": datetime.now(timezone.utc)}},
     )
+    seen = current_upserts()
+    if seen is not None and user_id in seen:
+        seen[user_id].update(language=language, language_selected=True)
+    if seen is not None:
+        seen[('language', user_id)] = language
     return language
 
 
@@ -1026,53 +1067,119 @@ async def toggle_product_favorite(user_id: int, product_name: str) -> bool:
     return not currently
 
 
-async def add_wallet_inr(user_id: int, amount: float):
-    await get_db().users.update_one(
-        {"user_id": user_id}, {"$inc": {"wallet_inr": round(amount, 2)}}
-    )
+async def add_wallet_inr(user_id: int, amount: float, reference: str = ""):
+    return await change_wallet_async(get_db(), user_id, "inr", round(amount, 2), reference=reference or uuid.uuid4().hex, source="topup")
 
 
-async def add_wallet_usdt(user_id: int, amount: float):
-    await get_db().users.update_one(
-        {"user_id": user_id}, {"$inc": {"wallet_usdt": round(amount, 2)}}
-    )
+async def add_wallet_usdt(user_id: int, amount: float, reference: str = ""):
+    return await change_wallet_async(get_db(), user_id, "usdt", round(amount, 2), reference=reference or uuid.uuid4().hex, source="topup")
 
 
-async def deduct_wallet_inr(user_id: int, amount: float) -> bool:
-    """Atomically deduct INR wallet balance only when enough balance exists.
-
-    The balance check and deduction happen in one MongoDB update, preventing two
-    fast wallet-payment clicks from both spending the same balance.
-    """
-    try:
-        amount = round(float(amount or 0), 2)
-    except (TypeError, ValueError):
-        return False
-    if amount <= 0:
-        return False
-    result = await get_db().users.update_one(
-        {"user_id": user_id, "wallet_inr": {"$gte": amount}},
-        {"$inc": {"wallet_inr": -amount}},
-    )
-    return bool(result.modified_count)
+async def deduct_wallet_inr(user_id: int, amount: float, reference: str = "") -> bool:
+    try: amount = round(float(amount or 0), 2)
+    except (ValueError, TypeError): return False
+    if amount <= 0: return False
+    return bool(await change_wallet_async(get_db(), user_id, "inr", -amount, reference=reference or uuid.uuid4().hex,
+        source="purchase", conditions={"wallet_inr": {"$gte": amount}}))
 
 
-async def deduct_wallet_usdt(user_id: int, amount: float) -> bool:
-    """Atomically deduct USDT wallet balance only when enough balance exists."""
-    try:
-        amount = round(float(amount or 0), 6)
-    except (TypeError, ValueError):
-        return False
-    if amount <= 0:
-        return False
-    result = await get_db().users.update_one(
-        {"user_id": user_id, "wallet_usdt": {"$gte": amount}},
-        {"$inc": {"wallet_usdt": -amount}},
-    )
-    return bool(result.modified_count)
+async def deduct_wallet_usdt(user_id: int, amount: float, reference: str = "") -> bool:
+    try: amount = round(float(amount or 0), 6)
+    except (ValueError, TypeError): return False
+    if amount <= 0: return False
+    return bool(await change_wallet_async(get_db(), user_id, "usdt", -amount, reference=reference or uuid.uuid4().hex,
+        source="purchase", conditions={"wallet_usdt": {"$gte": amount}}))
 
 
 # ─────────────────────────── PRODUCTS ────────────────────────
+
+API_KEY_PREFIX = "smo_"
+
+
+def generate_buyer_api_key() -> str:
+    return f"{API_KEY_PREFIX}{secrets.token_hex(24)}"
+
+
+def buyer_api_key_hash(api_key: str) -> str:
+    return hashlib.sha256(str(api_key or "").strip().encode("utf-8")).hexdigest()
+
+
+def buyer_api_key_prefix(api_key: str) -> str:
+    clean = str(api_key or "").strip()
+    return clean[:12] + "..." if len(clean) > 12 else clean
+
+
+async def get_user_api_summary(user_id: int) -> dict:
+    user = await get_user(user_id) or {}
+    return {
+        "enabled": bool(user.get("api_enabled")) and bool(user.get("api_key_hash")),
+        "disabled": user.get("api_enabled") is False,
+        "api_key": str(user.get("api_key") or ""),
+        "prefix": str(user.get("api_key_prefix") or ""),
+        "created_at": user.get("api_created_at"),
+        "last_rotated_at": user.get("api_last_rotated_at"),
+        "last_used_at": user.get("api_last_used_at"),
+        "request_count": int(user.get("api_request_count") or 0),
+    }
+
+
+async def rotate_user_api_key(user_id: int, username: str = "") -> str:
+    db = get_db()
+    existing = await get_user(user_id) or {}
+    if existing.get("api_enabled") is False:
+        raise PermissionError("API access is disabled. Contact support.")
+    now = datetime.now(timezone.utc)
+    username = (username or "").strip().lstrip("@")
+    for _ in range(8):
+        api_key = generate_buyer_api_key()
+        api_hash = buyer_api_key_hash(api_key)
+        if await db.users.find_one({"api_key_hash": api_hash}, {"_id": 1}):
+            continue
+        set_fields: dict[str, Any] = {
+            "api_enabled": True,
+            "api_key": api_key,
+            "api_key_hash": api_hash,
+            "api_key_prefix": buyer_api_key_prefix(api_key),
+            "api_last_rotated_at": now,
+            "last_user_interaction_at": now,
+        }
+        set_on_insert = {
+            "user_id": user_id,
+            "blocked": False,
+            "blocked_manually": False,
+            "blocked_by_delivery": False,
+            "wallet_inr": 0.0,
+            "wallet_usdt": 0.0,
+            "pricing_group": DEFAULT_PRICE_GROUP,
+            "joined_at": now,
+            "language": None,
+            "language_selected": False,
+            "api_created_at": now,
+        }
+        if username:
+            set_fields["username"] = username
+        result = await db.users.update_one(
+            {"user_id": user_id, "api_enabled": {"$ne": False}},
+            {"$set": set_fields, "$setOnInsert": set_on_insert},
+            upsert=not bool(existing),
+        )
+        if not result.matched_count and result.upserted_id is None:
+            raise PermissionError("API access is disabled. Contact support.")
+        return api_key
+    raise RuntimeError("Could not generate a unique API key.")
+
+
+async def ensure_user_api_key(user_id: int, username: str = "") -> tuple[str | None, dict]:
+    user = await upsert_user(user_id, username)
+    if user.get("api_enabled") is False:
+        return None, user
+    if user.get("api_key_hash"):
+        if user.get("api_key"):
+            return str(user.get("api_key")), user
+        return None, user
+    api_key = await rotate_user_api_key(user_id, username)
+    user = await get_user(user_id) or user
+    return api_key, user
 
 
 def parse_product_shop_order(value, default=None):
@@ -1440,6 +1547,345 @@ async def restore_popped_stock_items(
     return len(clean_items)
 
 
+def _supplier_purchase_url(base_url: str) -> str:
+    base = str(base_url or "").strip().rstrip("/")
+    if base.endswith("/api/telegram-buyer"):
+        return f"{base}/purchase"
+    if base.endswith("/api"):
+        return f"{base}/telegram-buyer/purchase"
+    return f"{base}/api/telegram-buyer/purchase"
+
+
+def _supplier_products_url(base_url: str) -> str:
+    base = str(base_url or "").strip().rstrip("/")
+    if base.endswith("/api/telegram-buyer"):
+        return f"{base}/products"
+    if base.endswith("/api"):
+        return f"{base}/telegram-buyer/products"
+    return f"{base}/api/telegram-buyer/products"
+
+
+def _supplier_item_text(row: Any) -> str:
+    if isinstance(row, str):
+        return row.strip()
+    if not isinstance(row, dict):
+        return str(row or "").strip()
+    raw = str(row.get("raw") or row.get("item") or row.get("code") or "").strip()
+    if raw:
+        return raw
+    parts = []
+    if row.get("user"):
+        parts.append(f"User: {row.get('user')}")
+    if row.get("password"):
+        parts.append(f"Pass: {row.get('password')}")
+    if row.get("verifyEmail"):
+        parts.append(f"Verify Email: {row.get('verifyEmail')}")
+    return "\n".join(parts).strip()
+
+
+def _supplier_response_items(payload: dict) -> list[str]:
+    candidates = payload.get("deliveredAccounts") or payload.get("items") or payload.get("accounts") or []
+    if not isinstance(candidates, list):
+        return []
+    return [text for text in (_supplier_item_text(row) for row in candidates) if text]
+
+
+def _normalize_supplier_fallbacks(product: dict | None) -> list[dict]:
+    if not product or not product.get("external_supplier_fallback_enabled"):
+        return []
+    rows = product.get("supplier_fallbacks") or []
+    if not isinstance(rows, list):
+        return []
+    clean_rows = []
+    for index, row in enumerate(rows):
+        if not isinstance(row, dict) or row.get("enabled") is False:
+            continue
+        supplier_id = str(row.get("supplier_id") or "").strip()
+        supplier_product_id = str(row.get("supplier_product_id") or "").strip()
+        if supplier_id and supplier_product_id:
+            clean_rows.append({
+                "supplier_id": supplier_id,
+                "supplier_product_id": supplier_product_id,
+                "priority": int(row.get("priority") or index + 1),
+            })
+    return sorted(clean_rows, key=lambda r: int(r.get("priority") or 999))
+
+
+async def product_has_external_supplier_fallback(product_or_name: Any) -> bool:
+    product = product_or_name if isinstance(product_or_name, dict) else await get_product(str(product_or_name or ""))
+    return bool(_normalize_supplier_fallbacks(product))
+
+
+async def _log_supplier_api_event(doc: dict) -> None:
+    try:
+        doc.setdefault("created_at", datetime.now(timezone.utc))
+        await get_db().supplier_api_logs.insert_one(doc)
+    except Exception:
+        logger.exception("Could not write supplier API log")
+
+
+_SUPPLIER_TASKS = {}
+_SUPPLIER_LOOP = None
+_SUPPLIER_SEMAPHORE = None
+_SUPPLIER_REFRESH_TASK = None
+
+
+async def stop_supplier_lookups():
+    global _SUPPLIER_REFRESH_TASK
+    if _SUPPLIER_REFRESH_TASK is not None:
+        _SUPPLIER_REFRESH_TASK.cancel()
+        await asyncio.gather(_SUPPLIER_REFRESH_TASK, return_exceptions=True)
+        _SUPPLIER_REFRESH_TASK = None
+    tasks = list(_SUPPLIER_TASKS.values())
+    for task in tasks:
+        task.cancel()
+    await asyncio.gather(*tasks, return_exceptions=True)
+    _SUPPLIER_TASKS.clear()
+
+
+async def refresh_supplier_catalogues():
+    """Warm linked vendor stock snapshots without delaying a user update."""
+    ids = set()
+    async for product in get_db().products.find(
+        {'external_supplier_fallback_enabled': True, 'enabled': {'$ne': False}},
+        {'external_supplier_fallback_enabled': 1, 'supplier_fallbacks': 1}):
+        ids.update(ObjectId(row['supplier_id']) for row in _normalize_supplier_fallbacks(product)
+                   if ObjectId.is_valid(row['supplier_id']))
+    if not ids:
+        return
+    suppliers = await get_db().supplier_apis.find({'_id': {'$in': list(ids)}, 'enabled': {'$ne': False}}).to_list(length=None)
+    await asyncio.gather(*(_supplier_catalogue(supplier, force_refresh=True) for supplier in suppliers))
+
+
+async def start_supplier_lookup_refresh():
+    global _SUPPLIER_REFRESH_TASK
+    if _SUPPLIER_REFRESH_TASK is not None and not _SUPPLIER_REFRESH_TASK.done():
+        return
+    async def worker():
+        while True:
+            try:
+                await refresh_supplier_catalogues()
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                logger.warning('Could not refresh vendor stock in the background.', exc_info=True)
+            await asyncio.sleep(20)
+    _SUPPLIER_REFRESH_TASK = asyncio.create_task(worker())
+
+
+@timed('vendor_catalogue')
+async def _supplier_catalogue(supplier, *, force_refresh=False):
+    global _SUPPLIER_LOOP, _SUPPLIER_SEMAPHORE
+    loop = asyncio.get_running_loop()
+    if _SUPPLIER_LOOP is not loop:
+        _SUPPLIER_LOOP = loop
+        _SUPPLIER_SEMAPHORE = asyncio.Semaphore(4)
+        _SUPPLIER_TASKS.clear()
+    key = 'vendor_catalogue:' + str(supplier['_id']) + ':' + hashlib.sha256(
+        (str(supplier.get('base_url')) + str(supplier.get('api_key'))).encode()).hexdigest()
+    cached = _cache_get(key, 30)
+    if not force_refresh and isinstance(cached, dict):
+        return cached
+    task = _SUPPLIER_TASKS.get(key)
+    if task is None:
+        async def fetch():
+            counts = {}
+            try:
+                async with _SUPPLIER_SEMAPHORE:
+                    async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=3)) as session:
+                        async with session.get(_supplier_products_url(supplier.get('base_url', '')),
+                            headers={'Authorization': 'Bearer ' + str(supplier.get('api_key') or '').strip()},
+                            params={'key': str(supplier.get('api_key') or '').strip()} if supplier.get('legacy_query_auth', True) else {}) as response:
+                            response.raise_for_status()
+                            data = await response.json(content_type=None)
+                if not isinstance(data, dict) or data.get('success') is False:
+                    raise ValueError('Vendor rejected stock lookup')
+                for row in data.get('products') or []:
+                    if isinstance(row, dict):
+                        counts[str(row.get('product_id') or row.get('_id') or '')] = max(0, int((row.get('stats') or {}).get('available') or 0))
+            except asyncio.CancelledError:
+                raise
+            except Exception as error:
+                logger.warning('Vendor catalogue check failed (%s). Check vendor URL and API access.', type(error).__name__)
+            _cache_set(key, counts)
+            return counts
+        task = asyncio.create_task(fetch())
+        _SUPPLIER_TASKS[key] = task
+        def completed(finished):
+            if _SUPPLIER_TASKS.get(key) is finished:
+                _SUPPLIER_TASKS.pop(key, None)
+        task.add_done_callback(completed)
+    try:
+        return await asyncio.wait_for(asyncio.shield(task), timeout=3.5)
+    except asyncio.TimeoutError:
+        return {}
+
+
+async def get_external_supplier_available_stock(product_or_name: Any, *, cache_seconds: int = 30, suppliers=None) -> int:
+    product = product_or_name if isinstance(product_or_name, dict) else await get_product(str(product_or_name or ''))
+    fallbacks = _normalize_supplier_fallbacks(product)
+    if not fallbacks:
+        return 0
+    ids = [ObjectId(row['supplier_id']) for row in fallbacks if ObjectId.is_valid(row['supplier_id'])]
+    if suppliers is None:
+        suppliers = {}
+        async for supplier in get_db().supplier_apis.find({'_id': {'$in': ids}, 'enabled': {'$ne': False}}):
+            suppliers[str(supplier['_id'])] = supplier
+    async def available(row):
+        supplier = suppliers.get(row['supplier_id'])
+        if not supplier:
+            return 0
+        counts = await _supplier_catalogue(supplier)
+        return int(counts.get(row['supplier_product_id'], 0))
+    return max(await asyncio.gather(*(available(row) for row in fallbacks)), default=0)
+
+@timed('stock')
+async def get_combined_available_stock_count(product: dict) -> int:
+    actual, pending, external = await asyncio.gather(get_stock_count(product['name']),
+        get_pending_stock_quantity(product['name']), get_external_supplier_available_stock(product))
+    return max(0, actual + external - pending)
+
+
+
+async def purchase_from_supplier_fallbacks(product_name: str, quantity: int, *, order_id: str = "") -> dict:
+    product = await get_product(product_name)
+    fallbacks = _normalize_supplier_fallbacks(product)
+    if not fallbacks:
+        return {"items": [], "source": "none", "error": "No supplier fallback configured"}
+
+    database = get_db()
+    supplier_ids = [ObjectId(row["supplier_id"]) for row in fallbacks if ObjectId.is_valid(row["supplier_id"])]
+    suppliers = {}
+    if supplier_ids:
+        async for supplier in database.supplier_apis.find({"_id": {"$in": supplier_ids}, "enabled": {"$ne": False}}):
+            suppliers[str(supplier.get("_id"))] = supplier
+
+    last_error = "No enabled supplier available"
+    timeout = aiohttp.ClientTimeout(total=35)
+    async with aiohttp.ClientSession(timeout=timeout) as session:
+        for row in fallbacks:
+            supplier = suppliers.get(row["supplier_id"])
+            if not supplier:
+                continue
+            payload = {
+                "key": str(supplier.get("api_key") or "").strip(),
+                "product_id": row["supplier_product_id"],
+                "quantity": int(quantity or 1),
+                "client_order_id": f"{order_id or uuid.uuid4().hex}-{row['supplier_id']}"[:120],
+            }
+            log_doc = {
+                "supplier_id": row["supplier_id"],
+                "supplier_alias": supplier.get("alias") or supplier.get("name") or "",
+                "product_name": product_name,
+                "supplier_product_id": row["supplier_product_id"],
+                "order_id": order_id,
+                "quantity": quantity,
+                "status": "failed",
+            }
+            try:
+                async with session.post(_supplier_purchase_url(supplier.get("base_url", "")), json=payload) as resp:
+                    data = await resp.json(content_type=None)
+                items = _supplier_response_items(data if isinstance(data, dict) else {})
+                if resp.status == 200 and isinstance(data, dict) and data.get("success") and len(items) >= quantity:
+                    log_doc.update({"status": "success", "supplier_order_code": data.get("orderCode"), "item_count": len(items)})
+                    await _log_supplier_api_event(log_doc)
+                    _cache_forget('vendor_catalogue:' + str(supplier['_id']) + ':' + hashlib.sha256(
+                        (str(supplier.get('base_url')) + str(supplier.get('api_key'))).encode()).hexdigest())
+                    return {
+                        "items": items[:quantity],
+                        "source": "supplier",
+                        "supplier_id": row["supplier_id"],
+                        "supplier_alias": log_doc["supplier_alias"],
+                        "supplier_product_id": row["supplier_product_id"],
+                        "supplier_order_code": data.get("orderCode"),
+                    }
+                if items or (isinstance(data, dict) and data.get("success")):
+                    log_doc.update(status="uncertain", error="Supplier reported an incomplete delivery", item_count=len(items))
+                    await _log_supplier_api_event(log_doc)
+                    return {"items": [], "source": "supplier", "uncertain": True, "supplier_id": row["supplier_id"],
+                            "supplier_partial_items": items, "error": "Supplier reported an incomplete delivery"}
+                last_error = str((data or {}).get("message") if isinstance(data, dict) else "") or f"Supplier HTTP {resp.status}"
+                log_doc.update({"error": last_error, "http_status": resp.status})
+            except Exception as exc:
+                last_error = str(exc).replace(str(supplier.get("api_key") or ""), "<redacted>")
+                log_doc.update({"error": last_error[:500], "status": "uncertain"})
+                await _log_supplier_api_event(log_doc)
+                return {"items": [], "source": "supplier", "uncertain": True, "supplier_id": row["supplier_id"],
+                        "client_order_id": payload["client_order_id"], "error": last_error}
+            await _log_supplier_api_event(log_doc)
+    return {"items": [], "source": "supplier", "error": last_error}
+
+
+async def fulfill_product_items(product_name: str, quantity: int, *, order_id: str = "") -> dict:
+    database = get_db()
+    order_query = {"order_id": str(order_id).strip().upper()}
+    saved = (await database.orders.find_one(order_query) or {}).get("fulfillment_reservation", {}) if order_id else {}
+    if saved.get("phase") == "ready":
+        return saved["result"]
+    if saved.get("phase") in {"requesting", "uncertain"}:
+        return {"items": [], "source": "supplier", "uncertain": True, "error": "Supplier purchase needs owner review"}
+    # Reserve the local portion using an exact-array compare and swap. Paid
+    # orders reach here in FIFO order; public API orders reserve pending stock.
+    local = []
+    for _ in range(5):
+        product = await get_product(product_name)
+        stock = list((product or {}).get("stock") or [])
+        take = min(quantity, len(stock))
+        if not take:
+            break
+        changed = await database.products.update_one({"_id": product["_id"], "stock": stock},
+            {"$set": {"stock": stock[take:]}})
+        if changed.modified_count:
+            local = stock[:take]
+            try:
+                await record_stock_ledger_status(product_name, local, "popped", source="telegram_bot", note="Reserved local portion before supplier fulfillment")
+            except Exception:
+                logger.exception("Reserved local stock; ledger entry needs review")
+            break
+    if len(local) == quantity:
+        return {"items": local, "local_items": local, "source": "local_stock"}
+    if order_id:
+        await database.orders.update_one(order_query, {"$set": {"fulfillment_reservation": {
+            "phase": "requesting", "local_items": local, "supplier_quantity": quantity - len(local)}}})
+    try:
+        result = await purchase_from_supplier_fallbacks(product_name, quantity - len(local), order_id=order_id)
+    except Exception:
+        if local:
+            await restore_popped_stock_items(product_name, local)
+        raise
+    if len(result.get("items") or []) == quantity - len(local):
+        result.update(items=local + result["items"], local_items=local, local_quantity=len(local), supplier_quantity=quantity - len(local))
+        if order_id:
+            await database.orders.update_one(order_query, {"$set": {"fulfillment_reservation": {"phase": "ready", "result": result}}})
+        return result
+    if local:
+        await restore_popped_stock_items(product_name, local)
+    if order_id:
+        await database.orders.update_one(order_query, {"$set": {"fulfillment_reservation": {
+            "phase": "uncertain" if result.get("uncertain") else "failed", "error": result.get("error", "Supplier rejected purchase"),
+            "supplier_partial_items": result.get("supplier_partial_items", [])},
+            "supplier_outcome_uncertain": bool(result.get("uncertain"))}})
+    return result
+
+
+async def attach_order_supplier_info(order_id: str, fulfillment: dict) -> None:
+    if not fulfillment or fulfillment.get("source") != "supplier":
+        return
+    await get_db().orders.update_one(
+        {"order_id": str(order_id or "").strip().upper()},
+        {"$set": {
+            "external_supplier_delivery": True,
+            "supplier_id": fulfillment.get("supplier_id"),
+            "supplier_alias": fulfillment.get("supplier_alias"),
+            "supplier_product_id": fulfillment.get("supplier_product_id"),
+            "supplier_order_code": fulfillment.get("supplier_order_code"),
+            "local_delivered_quantity": fulfillment.get("local_quantity", 0),
+            "supplier_delivered_quantity": fulfillment.get("supplier_quantity"),
+            "supplier_delivered_at": datetime.now(timezone.utc),
+        }},
+    )
+
+
 async def get_stock_count(product_name: str) -> int:
     """Count live stock without downloading the full stock array from MongoDB."""
     rows = await get_db().products.aggregate([
@@ -1486,8 +1932,7 @@ async def get_pending_stock_quantity_map() -> dict[str, int]:
 
 async def get_available_stock_count(product_name: str) -> int:
     """Stock available for new buyers after paid pending-stock orders are considered."""
-    actual = await get_stock_count(product_name)
-    pending_qty = await get_pending_stock_quantity(product_name)
+    actual, pending_qty = await asyncio.gather(get_stock_count(product_name), get_pending_stock_quantity(product_name))
     return max(0, actual - pending_qty)
 
 
@@ -1731,6 +2176,7 @@ async def claim_restock_notification_slot(
     return bool(result.modified_count)
 
 
+@timed('catalogue')
 async def get_all_products_with_availability(include_disabled: bool = False) -> list[dict]:
     """Return products with stock/preorder availability using bulk queries.
 
@@ -1748,8 +2194,11 @@ async def get_all_products_with_availability(include_disabled: bool = False) -> 
         "price_usdt": 1,
         "price_group_prices": 1,
         "enabled": 1,
+        "api_enabled": 1,
+        "api_product_id": 1,
         "created_at": 1,
         "shop_order": 1,
+        "premium_emoji_id": 1,
         "low_stock_threshold": 1,
         "min_order_quantity": 1,
         "max_order_quantity": 1,
@@ -1760,18 +2209,18 @@ async def get_all_products_with_availability(include_disabled: bool = False) -> 
         "preorder_enabled": 1,
         "preorder_max_quantity": 1,
         "preorder_total_limit": 1,
+        "external_supplier_fallback_enabled": 1,
+        "supplier_fallbacks": 1,
         "stock_manager_earning_rate_usdt": 1,
         "stock_manager_owner_rate_usdt": 1,
         "actual_stock": _product_stock_count_expr(),
     }
-    products = await get_db().products.aggregate([
-        {"$match": visibility_query},
-        {"$project": project},
-    ]).to_list(length=None)
+    products, pending_by_product, active_backorder_by_product = await asyncio.gather(
+        get_db().products.aggregate([
+            {"$match": visibility_query}, {"$project": project},
+        ]).to_list(length=None),
+        get_pending_stock_quantity_map(), get_active_preorder_backorder_quantity_map())
     products = sort_products_for_shop(products)
-
-    pending_by_product = await get_pending_stock_quantity_map()
-    active_backorder_by_product = await get_active_preorder_backorder_quantity_map()
 
     for product in products:
         key = _product_name_key(product.get("name"))
@@ -1787,7 +2236,24 @@ async def get_all_products_with_availability(include_disabled: bool = False) -> 
         product["preorder_total_limit"] = get_product_preorder_total_limit(product)
         product["active_preorder_quantity"] = active_preorders
         product["preorder_capacity_remaining"] = get_preorder_capacity_remaining(product, active_preorders)
-        product["available_stock"] = max(0, actual_stock - pending_qty)
+        local_available = max(0, actual_stock - pending_qty)
+        product["available_stock"] = local_available
+        product["external_supplier_available"] = bool(_normalize_supplier_fallbacks(product))
+        product["external_supplier_stock"] = 0
+        if product["external_supplier_available"]:
+            product["external_supplier_stock"] = None
+    supplier_ids = {ObjectId(row['supplier_id']) for product in products
+                    for row in _normalize_supplier_fallbacks(product) if ObjectId.is_valid(row['supplier_id'])}
+    suppliers = {}
+    if supplier_ids:
+        async for supplier in get_db().supplier_apis.find({'_id': {'$in': list(supplier_ids)}, 'enabled': {'$ne': False}}):
+            suppliers[str(supplier['_id'])] = supplier
+    async def load_external(product):
+        if product.get("external_supplier_stock") is None:
+            available = await get_external_supplier_available_stock(product, suppliers=suppliers)
+            product["external_supplier_stock"] = available
+            product["available_stock"] = max(0, product["actual_stock"] + available - product["pending_stock_quantity"])
+    await asyncio.gather(*(load_external(product) for product in products))
     return products
 
 
@@ -2243,8 +2709,9 @@ async def credit_cancelled_order_refund_to_wallet(order_id: str, user_id: int) -
         )
         return None
 
-    field = "wallet_inr" if currency == "inr" else "wallet_usdt"
-    await get_db().users.update_one({"user_id": int(user_id)}, {"$inc": {field: round(amount, 2)}}, upsert=True)
+    await get_db().orders.update_one({"order_id": clean_order_id}, {"$set": {
+        "wallet_refund_event_id": event_id(int(user_id), currency, "refund-" + clean_order_id), "wallet_refund_event_delta": round(amount, 2)}})
+    await change_wallet_async(get_db(), int(user_id), currency, round(amount, 2), reference="refund-" + clean_order_id, source="refund")
     await get_db().orders.update_one(
         {"order_id": clean_order_id},
         {"$set": {"refund_currency": currency, "refund_amount": round(amount, 2)}},
@@ -2901,6 +3368,7 @@ async def get_setting(key: str, default=None):
     return doc.get("value", default) if doc else default
 
 
+@timed('secret_settings')
 async def get_secret_settings() -> dict:
     cached = _cache_get("secret_settings_full", 15.0)
     if isinstance(cached, dict):
@@ -3435,6 +3903,7 @@ async def mark_wallet_load_credited(ref_id: str) -> Optional[dict]:
     Returns the payment row only the first time it is credited. Subsequent calls
     return None, which prevents duplicate wallet balance updates.
     """
+    pending = await get_db().pending_payments.find_one({"ref_id": ref_id}) or {}
     return await get_db().pending_payments.find_one_and_update(
         {
             "ref_id": ref_id,
@@ -3447,6 +3916,8 @@ async def mark_wallet_load_credited(ref_id: str) -> Optional[dict]:
         {
             "$set": {
                 "wallet_credited_at": datetime.now(timezone.utc),
+                "wallet_event_id": event_id(pending.get("user_id"), pending.get("currency", "inr"), "topup-" + ref_id),
+                "wallet_event_delta": round(float(pending.get("load_amount", 0) or 0), 2),
                 "status": "completed",
             }
         },
