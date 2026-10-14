@@ -1,5 +1,7 @@
 """Check current membership before interactive bot access; never cache a join forever."""
 
+import asyncio
+from types import SimpleNamespace
 import logging
 import time
 import re
@@ -67,27 +69,43 @@ async def handle_membership_update(update, context):
     for key in list(cache):
         if key[1] == uid:
             cache.pop(key, None)
+    key = (channel, uid)
+    # Only keep revisions for in-flight checks. A leave event must never be
+    # overwritten by a background request that began before the user left.
+    if context.bot_data.get('channel_membership_inflight', {}).get(key):
+        context.bot_data.setdefault('channel_membership_revisions', {})[key] = (
+            time.monotonic_ns(), chat_member_is_joined(event.new_chat_member))
     # Telegram's leave/join events invalidate the cached status immediately.
 
 
-async def _check_membership(context, settings, user_id, force=False):
+async def _check_membership(context, settings, user_id, force=False, refresh=False):
     cache = context.bot_data.setdefault('channel_membership_cache', {})
     key = (settings['required_channel_id'], user_id)
     cached = cache.get(key)
     if not force and _ttl(settings) and cached and cached[0] > time.monotonic():
         return True
-    cache.pop(key, None)
+    if not refresh:
+        cache.pop(key, None)
     if context.bot_data.get("channel_membership_retry_until", 0) > time.monotonic():
         return None
     channel_id = settings["required_channel_id"]
     if channel_id.startswith("-100"):
         channel_id = int(channel_id)
+    inflight = context.bot_data.setdefault('channel_membership_inflight', {})
+    revisions = context.bot_data.setdefault('channel_membership_revisions', {})
+    revision = revisions.get(key)
+    inflight[key] = inflight.get(key, 0) + 1
     try:
         member = await context.bot.get_chat_member(
             chat_id=channel_id, user_id=user_id,
             read_timeout=3, connect_timeout=3, write_timeout=3, pool_timeout=3,
         )
         joined = chat_member_is_joined(member)
+        if revisions.get(key) != revision:
+            # Trust the newer signed membership event, not the old RPC result.
+            return bool(revisions.get(key, (None, False))[1])
+        if not joined:
+            cache.pop(key, None)
         if joined and _ttl(settings):
             if len(cache) >= 10000:
                 cache.pop(next(iter(cache)), None)
@@ -100,7 +118,54 @@ async def _check_membership(context, settings, user_id, force=False):
         logger.warning("Channel membership checks temporarily rate limited by Telegram.")
     except TelegramError as error:
         logger.warning("Channel membership check failed (%s). Check channel ID and bot admin access.", type(error).__name__)
+    finally:
+        inflight[key] -= 1
+        if not inflight[key]:
+            inflight.pop(key, None)
+            revisions.pop(key, None)
     return None
+
+
+async def refresh_recent_memberships(context):
+    raw = await db.get_secret_settings()
+    if not channel_gate_enabled(raw.get('required_channel_enabled')) or not _ttl(raw):
+        return
+    try:
+        settings = validate_channel_settings(True, raw.get('required_channel_id'), raw.get('required_channel_join_url'))
+    except ValueError:
+        return
+    settings['required_channel_cache_seconds'] = raw.get('required_channel_cache_seconds', 30)
+    cache = context.bot_data.setdefault('channel_membership_cache', {})
+    recent = context.bot_data.setdefault('channel_membership_recent', {})
+    current = time.monotonic()
+    for key, last_seen in list(recent.items()):
+        if last_seen < current - 300 or key[0] != settings['required_channel_id']:
+            recent.pop(key, None)
+            cache.pop(key, None)
+    ahead = min(10, max(0.5, _ttl(settings) / 3))
+    due = sorted([(key, value) for key, value in cache.items() if key in recent and value[0] <= current + ahead],
+                 key=lambda row: row[1][0])[:4]
+    for key, _ in due:
+        await _check_membership(context, settings, key[1], force=True, refresh=True)
+        if context.bot_data.get('channel_membership_retry_until', 0) > time.monotonic():
+            break
+
+
+async def start_membership_cache_refresh(application):
+    task = application.bot_data.get('channel_membership_refresh_task')
+    if task is not None and not task.done():
+        return
+    context = SimpleNamespace(bot=application.bot, bot_data=application.bot_data)
+    async def worker():
+        while True:
+            try:
+                await refresh_recent_memberships(context)
+            except asyncio.CancelledError:
+                raise
+            except Exception as error:
+                logger.warning('Background membership refresh failed (%s).', type(error).__name__)
+            await asyncio.sleep(1)
+    application.bot_data['channel_membership_refresh_task'] = asyncio.create_task(worker())
 
 
 async def require_channel_membership(update, context):
@@ -143,6 +208,11 @@ async def require_channel_membership(update, context):
         settings = {}
         joined = None
     if joined is True:
+        recent = context.bot_data.setdefault('channel_membership_recent', {})
+        key = (settings['required_channel_id'], user.id)
+        if len(recent) >= 10000 and key not in recent:
+            recent.pop(next(iter(recent)), None)
+        recent[key] = time.monotonic()
         # No prompt, no persistent exemption. The next action checks membership again.
         return
     if query:

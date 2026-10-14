@@ -24,7 +24,7 @@ from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
 from urllib.parse import parse_qsl, urlsplit
 
 from motor.motor_asyncio import AsyncIOMotorClient
-from pymongo import ReturnDocument
+from pymongo import ReturnDocument, UpdateOne
 from pymongo.errors import DuplicateKeyError
 from bson import ObjectId
 from config import MONGO_URI, DB_NAME, MONGO_TLS_ALLOW_INVALID_CERTIFICATES, is_admin_id
@@ -33,6 +33,11 @@ from utils.update_context import current_upserts, timed
 _client: Optional[AsyncIOMotorClient] = None
 _db = None
 _SETTING_CACHE: dict[str, tuple[float, Any]] = {}
+_CACHE_GENERATIONS = {}
+_RUNTIME_REFRESHED = {}
+_INTERACTION_TOUCHES = {}
+_RUNTIME_CACHE_TASK = None
+_INTERACTION_TASK = None
 logger = logging.getLogger(__name__)
 
 
@@ -52,6 +57,7 @@ def _cache_set(key: str, value: Any) -> None:
 
 def _cache_forget(key: str) -> None:
     _SETTING_CACHE.pop(key, None)
+    _CACHE_GENERATIONS[key] = _CACHE_GENERATIONS.get(key, 0) + 1
 
 
 async def get_setting_cached(key: str, default=None, *, ttl_seconds: float = 5.0):
@@ -554,6 +560,7 @@ def get_db():
             tls=True,
             tlsAllowInvalidCertificates=MONGO_TLS_ALLOW_INVALID_CERTIFICATES,
             serverSelectionTimeoutMS=30000,
+            minPoolSize=1,
         )
         _db = AsyncGuardedDatabase(_client[DB_NAME])
     return _db
@@ -834,6 +841,18 @@ async def upsert_user(user_id: int, username: str = "") -> dict:
             existing.pop("blocked_reason", None)
             existing.pop("last_delivery_error", None)
 
+        # Activity is metadata, not a wallet/order mutation. Batch it outside
+        # the reply path; real profile/block changes still save immediately.
+        touch = set_updates.pop("last_user_interaction_at", None)
+        if (set_updates or unset_updates or (last_seen is not None and not isinstance(last_seen, datetime)) or
+            (isinstance(last_seen, datetime) and last_seen.replace(tzinfo=timezone.utc) > now)):
+            set_updates["last_user_interaction_at"] = now
+        elif touch is not None:
+            if user_id in _INTERACTION_TOUCHES or len(_INTERACTION_TOUCHES) < 10000:
+                _INTERACTION_TOUCHES[user_id] = now
+                existing["last_user_interaction_at"] = now
+            else:
+                set_updates["last_user_interaction_at"] = now
         update_doc: dict[str, Any] = {"$set": set_updates}
         if unset_updates:
             update_doc["$unset"] = unset_updates
@@ -3385,6 +3404,88 @@ async def get_secret_settings() -> dict:
         pass
     _cache_set("secret_settings_full", dict(settings))
     return settings
+
+
+async def flush_user_interactions():
+    pending = list(_INTERACTION_TOUCHES.items())[:1000]
+    if not pending:
+        return
+    changes = [UpdateOne({'user_id': uid, '$or': [
+        {'last_user_interaction_at': {'$lt': stamp}},
+        {'last_user_interaction_at': {'$exists': False}}, {'last_user_interaction_at': None}]},
+        {'$set': {'last_user_interaction_at': stamp}}, upsert=False) for uid, stamp in pending]
+    await get_db().users.bulk_write(changes, ordered=False)
+    for uid, stamp in pending:
+        if _INTERACTION_TOUCHES.get(uid) == stamp:
+            _INTERACTION_TOUCHES.pop(uid, None)
+
+
+async def refresh_runtime_cache():
+    defaults = {'secret_settings': {}, 'language_settings': {}, 'maintenance_mode': False,
+                PAYMENT_SETTINGS_KEY: {}}
+    intervals = {'secret_settings': 10, 'language_settings': 5, 'maintenance_mode': 1, PAYMENT_SETTINGS_KEY: 3}
+    current = time.monotonic()
+    names = [name for name in defaults if current - _RUNTIME_REFRESHED.get(name, float('-inf')) >= intervals[name]
+             or 'setting:' + name not in _SETTING_CACHE
+             or (name == 'secret_settings' and 'secret_settings_full' not in _SETTING_CACHE)]
+    if not names:
+        return
+    keys = ['setting:' + name for name in names] + ['secret_settings_full']
+    generations = {key: _CACHE_GENERATIONS.get(key, 0) for key in keys}
+    query = get_db().settings.find({'key': {'$in': names}}, {'key': 1, 'value': 1}).to_list(length=None)
+    if 'secret_settings' in names:
+        docs, token_doc = await asyncio.gather(query,
+            get_db().runtime_config.find_one({'key': 'telegram_bot_token'}), return_exceptions=True)
+        if isinstance(docs, BaseException):
+            raise docs
+    else:
+        docs = await query
+        token_doc = None
+    values = {doc['key']: doc.get('value', defaults[doc['key']]) for doc in docs}
+    for name in names:
+        key = 'setting:' + name
+        if generations[key] == _CACHE_GENERATIONS.get(key, 0):
+            _cache_set(key, values.get(name, defaults[name]))
+            _RUNTIME_REFRESHED[name] = time.monotonic()
+    if ('secret_settings' in names and
+        generations['secret_settings_full'] == _CACHE_GENERATIONS.get('secret_settings_full', 0) and
+        generations['setting:secret_settings'] == _CACHE_GENERATIONS.get('setting:secret_settings', 0)):
+        secret = values.get('secret_settings') or {}
+        settings = dict(secret) if isinstance(secret, dict) else {}
+        if isinstance(token_doc, dict) and token_doc.get('value'):
+            settings.update(bot_token=str(token_doc['value']).strip(), bot_token_runtime_updated_at=token_doc.get('updated_at'))
+        if not isinstance(token_doc, BaseException):
+            _cache_set('secret_settings_full', settings)
+
+
+async def start_runtime_cache_refresh():
+    global _RUNTIME_CACHE_TASK, _INTERACTION_TASK
+    async def worker(name, action):
+        while True:
+            try:
+                await action()
+            except asyncio.CancelledError:
+                raise
+            except Exception as error:
+                logger.warning('Background %s refresh failed (%s).', name, type(error).__name__)
+            await asyncio.sleep(1)
+    if _RUNTIME_CACHE_TASK is None or _RUNTIME_CACHE_TASK.done():
+        _RUNTIME_CACHE_TASK = asyncio.create_task(worker('settings', refresh_runtime_cache))
+    if _INTERACTION_TASK is None or _INTERACTION_TASK.done():
+        _INTERACTION_TASK = asyncio.create_task(worker('activity', flush_user_interactions))
+
+
+async def stop_runtime_cache_refresh():
+    global _RUNTIME_CACHE_TASK, _INTERACTION_TASK
+    tasks = [task for task in (_RUNTIME_CACHE_TASK, _INTERACTION_TASK) if task is not None]
+    for task in tasks:
+        task.cancel()
+    await asyncio.gather(*tasks, return_exceptions=True)
+    _RUNTIME_CACHE_TASK = _INTERACTION_TASK = None
+    try:
+        await asyncio.wait_for(flush_user_interactions(), timeout=3)
+    except Exception as error:
+        logger.warning('Could not flush final user activity (%s).', type(error).__name__)
 
 
 def parse_positive_int(value, default: int, *, minimum: int = 1) -> int:

@@ -48,10 +48,11 @@ from config import (
 import database as db
 from utils.i18n import tr
 from utils.data_guard import async_work_guard, async_update_unit
+from utils.telegram_request import WarmTelegramRequest
 
 from handlers.polls import handle_poll_answer, handle_survey_callback, start_poll_watcher
 from handlers.api_receipts import start_api_receipt_watcher, stop_background_services
-from handlers.channel_gate import require_channel_membership, handle_channel_gate_action, handle_membership_update
+from handlers.channel_gate import require_channel_membership, handle_channel_gate_action, handle_membership_update, start_membership_cache_refresh
 from handlers.api_catalog import cmd_api_products, handle_api_catalog
 from utils.update_processor import OrderedUserProcessor
 from utils.update_context import upserts, UpdateCache
@@ -760,6 +761,12 @@ async def post_init(application):
     except Exception as e:
         logger.exception("❌ Could not start global Binance Pay watcher: %s", e)
 
+    try:
+        await db.refresh_runtime_cache()
+    except Exception as error:
+        logger.warning('Could not warm bot settings (%s).', type(error).__name__)
+    await db.start_runtime_cache_refresh()
+    await start_membership_cache_refresh(application)
     await db.start_supplier_lookup_refresh()
     await start_poll_watcher(application)
     await start_api_receipt_watcher(application)
@@ -804,7 +811,8 @@ def main():
         ApplicationBuilder()
         .application_class(CoordinatedApplication)
         .concurrent_updates(OrderedUserProcessor(8))
-        .bot(NotificationRecordingBot(token=BOT_TOKEN))
+        .bot(NotificationRecordingBot(token=BOT_TOKEN, request=WarmTelegramRequest(connection_pool_size=32),
+                                    get_updates_request=WarmTelegramRequest(connection_pool_size=1)))
         .post_init(post_init)
         .post_stop(stop_background_services)
         .build()
