@@ -1130,15 +1130,19 @@ def buyer_api_key_prefix(api_key: str) -> str:
 
 async def get_user_api_summary(user_id: int) -> dict:
     user = await get_user(user_id) or {}
+    settings = await get_secret_settings()
     return {
-        "enabled": bool(user.get("api_enabled")) and bool(user.get("api_key_hash")),
+        "enabled": user.get("api_enabled") is not False and bool(user.get("api_key_hash")),
+        "has_key": bool(user.get("api_key_hash")),
         "disabled": user.get("api_enabled") is False,
         "api_key": str(user.get("api_key") or ""),
         "prefix": str(user.get("api_key_prefix") or ""),
         "created_at": user.get("api_created_at"),
         "last_rotated_at": user.get("api_last_rotated_at"),
+        "low_balance_alerts_enabled": user.get("api_low_balance_alerts_enabled") is not False,
         "last_used_at": user.get("api_last_used_at"),
         "request_count": int(user.get("api_request_count") or 0),
+        "endpoint_url": str(settings.get("buyer_api_endpoint_url") or ""),
     }
 
 
@@ -1189,6 +1193,7 @@ async def rotate_user_api_key(user_id: int, username: str = "") -> str:
 
 
 async def ensure_user_api_key(user_id: int, username: str = "") -> tuple[str | None, dict]:
+    """Create a key only for an explicit Generate click; concurrent clicks reuse it."""
     user = await upsert_user(user_id, username)
     if user.get("api_enabled") is False:
         return None, user
@@ -1196,9 +1201,27 @@ async def ensure_user_api_key(user_id: int, username: str = "") -> tuple[str | N
         if user.get("api_key"):
             return str(user.get("api_key")), user
         return None, user
-    api_key = await rotate_user_api_key(user_id, username)
-    user = await get_user(user_id) or user
-    return api_key, user
+    database = get_db()
+    for _ in range(8):
+        api_key = generate_buyer_api_key()
+        current = datetime.now(timezone.utc)
+        try:
+            result = await database.users.update_one({"user_id": user_id,
+                "api_enabled": {"$ne": False}, "$or": [
+                    {"api_key_hash": {"$exists": False}}, {"api_key_hash": None}, {"api_key_hash": ""}]},
+                {"$set": {"api_enabled": True, "api_key": api_key,
+                    "api_key_hash": buyer_api_key_hash(api_key), "api_key_prefix": buyer_api_key_prefix(api_key),
+                    "api_created_at": current, "api_last_rotated_at": current}})
+        except DuplicateKeyError:
+            continue
+        user = await database.users.find_one({"user_id": user_id}) or user
+        if result.matched_count:
+            return api_key, user
+        if user.get("api_enabled") is False:
+            return None, user
+        if user.get("api_key_hash"):
+            return str(user.get("api_key") or "") or None, user
+    raise RuntimeError("Could not generate a unique API key.")
 
 
 def parse_product_shop_order(value, default=None):
@@ -1316,7 +1339,7 @@ async def set_product_shop_order(name: str, shop_order: int | None) -> bool:
 
 async def remove_product(name: str) -> bool:
     res = await get_db().products.delete_one(
-        {"name": _name_regex(name)}
+        {"name": _name_regex(name), "$or": [{"stock_reservations": {"$exists": False}}, {"stock_reservations": {}}]}
     )
     return res.deleted_count > 0
 
@@ -1414,6 +1437,8 @@ async def add_stock(
         for item in (product.get("stock", []) or [])
         if normalize_approved_stock_item(item)
     }
+    for hold in (product.get("stock_reservations") or {}).values():
+        existing.update(normalize_approved_stock_item(item) for item in (hold.get("items") or []) if normalize_approved_stock_item(item))
     cursor = get_db().orders.find(
         {"product_name": _name_regex(product_name), "items.0": {"$exists": True}},
         {"items": 1},
@@ -1843,10 +1868,17 @@ async def fulfill_product_items(product_name: str, quantity: int, *, order_id: s
         return saved["result"]
     if saved.get("phase") in {"requesting", "uncertain"}:
         return {"items": [], "source": "supplier", "uncertain": True, "error": "Supplier purchase needs owner review"}
+    reservation = None
+    order = await database.orders.find_one(order_query) if order_id else None
+    if order and order.get("stock_reservation_enabled"):
+        from utils.stock_reservations import reserve_stock_async
+        reservation = await reserve_stock_async(database, order_id, product_name, quantity, order["user_id"], protected=True, partial=True)
+        if not reservation.get("ok"):
+            return {"items": [], "source": "none", "error": "Stock reservation is busy"}
     # Reserve the local portion using an exact-array compare and swap. Paid
     # orders reach here in FIFO order; public API orders reserve pending stock.
-    local = []
-    for _ in range(5):
+    local = list(reservation["items"]) if reservation else []
+    for _ in range(0 if reservation else 5):
         product = await get_product(product_name)
         stock = list((product or {}).get("stock") or [])
         take = min(quantity, len(stock))
@@ -1862,22 +1894,22 @@ async def fulfill_product_items(product_name: str, quantity: int, *, order_id: s
                 logger.exception("Reserved local stock; ledger entry needs review")
             break
     if len(local) == quantity:
-        return {"items": local, "local_items": local, "source": "local_stock"}
+        return {"items": local, "local_items": local, "source": "local_stock", "reserved_local": bool(reservation)}
     if order_id:
         await database.orders.update_one(order_query, {"$set": {"fulfillment_reservation": {
             "phase": "requesting", "local_items": local, "supplier_quantity": quantity - len(local)}}})
     try:
         result = await purchase_from_supplier_fallbacks(product_name, quantity - len(local), order_id=order_id)
     except Exception:
-        if local:
+        if local and not reservation:
             await restore_popped_stock_items(product_name, local)
         raise
     if len(result.get("items") or []) == quantity - len(local):
-        result.update(items=local + result["items"], local_items=local, local_quantity=len(local), supplier_quantity=quantity - len(local))
+        result.update(reserved_local=bool(reservation), items=local + result["items"], local_items=local, local_quantity=len(local), supplier_quantity=quantity - len(local))
         if order_id:
             await database.orders.update_one(order_query, {"$set": {"fulfillment_reservation": {"phase": "ready", "result": result}}})
         return result
-    if local:
+    if local and not reservation:
         await restore_popped_stock_items(product_name, local)
     if order_id:
         await database.orders.update_one(order_query, {"$set": {"fulfillment_reservation": {
@@ -1929,7 +1961,7 @@ async def get_pending_stock_quantity(product_name: str) -> int:
                 "status": "pending_stock",
             }
         },
-        {"$group": {"_id": None, "total": {"$sum": {"$ifNull": ["$quantity", 1]}}}},
+        {"$group": {"_id": None, "total": {"$sum": {"$max": [0, {"$subtract": [{"$ifNull": ["$quantity", 1]}, {"$ifNull": ["$stock_reserved_quantity", 0]}]}]}}}},
     ])
     rows = await cursor.to_list(length=1)
     return int(rows[0].get("total", 0)) if rows else 0
@@ -1939,7 +1971,7 @@ async def get_pending_stock_quantity_map() -> dict[str, int]:
     """Return pending-stock quantities for all products in one DB round trip."""
     rows = await get_db().orders.aggregate([
         {"$match": {"status": "pending_stock"}},
-        {"$group": {"_id": "$product_name", "total": {"$sum": {"$ifNull": ["$quantity", 1]}}}},
+        {"$group": {"_id": "$product_name", "total": {"$sum": {"$max": [0, {"$subtract": [{"$ifNull": ["$quantity", 1]}, {"$ifNull": ["$stock_reserved_quantity", 0]}]}]}}}},
     ]).to_list(length=None)
     totals: dict[str, int] = {}
     for row in rows:
@@ -2590,6 +2622,14 @@ async def update_order_status(
     if status in {"delivered", "pending_stock", "expired", "cancelled", "rejected"}:
         update["$unset"] = {"delivery_lock_token": "", "delivery_lock_at": ""}
     res = await get_db().orders.update_one(query, update)
+    if res.matched_count and status in {"delivered", "expired", "cancelled", "rejected", "failed"}:
+        try:
+            from utils.stock_reservations import release_stock_async
+            held_order = await get_db().orders.find_one({"order_id": clean_order_id}) or {}
+            if held_order.get("stock_reservation_enabled"):
+                await release_stock_async(get_db(), clean_order_id, held_order["product_name"], discard=status == "delivered")
+        except Exception:
+            logger.exception("Stock reservation cleanup deferred for %s", clean_order_id)
     if res.matched_count and status == "delivered" and items:
         try:
             order = await get_db().orders.find_one({"order_id": clean_order_id}) or {}
@@ -3666,6 +3706,11 @@ async def create_pending_payment(
         "created_at": time.time(),
         "language": await get_user_language(user_id),
     }
+    if pay_type == "order":
+        held_order = await get_db().orders.find_one({"order_id": ref_id}) or {}
+        deadline = held_order.get("stock_reservation_expires_at")
+        if deadline:
+            doc["stock_reservation_expires_at"] = deadline
     await get_db().pending_payments.insert_one(doc)
     return doc
 
@@ -3687,7 +3732,7 @@ async def update_pending_status(ref_id: str, status: str, reviewed: bool = False
         if reviewed_by is not None:
             update["reviewed_by"] = reviewed_by
     await get_db().pending_payments.update_one(
-        {"ref_id": ref_id}, {"$set": update}
+        {"ref_id": ref_id, **({"status": "waiting"} if status in {"upi_submitted", "binance_submitted", "usdt_manual_submitted"} else {})}, {"$set": update}
     )
 
 
@@ -4102,21 +4147,25 @@ async def set_upi_details(ref_id: str, payee_name: str, txn_id: str, screenshot_
     }
     if screenshot_file_id:
         update["upi_screenshot_file_id"] = screenshot_file_id
-    await get_db().pending_payments.update_one(
-        {"ref_id": ref_id},
+    result = await get_db().pending_payments.update_one(
+        {"ref_id": ref_id, "status": "waiting"},
         {"$set": update},
     )
 
+    return bool(result.matched_count)
+
 
 async def set_binance_details(ref_id: str, binance_name: str, screenshot_file_id: str):
-    await get_db().pending_payments.update_one(
-        {"ref_id": ref_id},
+    result = await get_db().pending_payments.update_one(
+        {"ref_id": ref_id, "status": "waiting"},
         {"$set": {
             "binance_name": binance_name,
             "binance_screenshot_file_id": screenshot_file_id,
             "status": "binance_submitted",
         }},
     )
+
+    return bool(result.matched_count)
 
 
 async def mark_payment_reminder_sent(ref_id: str) -> Optional[dict]:
@@ -4197,6 +4246,8 @@ async def expire_stale_unpaid_payments_and_orders(timeout_minutes: int = 30) -> 
     submitted proof, the order remains pending until an admin approves/rejects it.
     This cleanup supports numeric, datetime, and ISO-string created_at fields.
     """
+    from utils.stock_reservations import sweep_reservations_async
+    await sweep_reservations_async(get_db())
     timeout_seconds = max(60, int(timeout_minutes or 30) * 60)
     cutoff_ts = time.time() - timeout_seconds
     now_dt = datetime.now(timezone.utc)
@@ -4206,7 +4257,7 @@ async def expire_stale_unpaid_payments_and_orders(timeout_minutes: int = 30) -> 
     # Expire waiting payments by parsing created_at in Python so legacy datetime
     # or string values are handled too, not only numeric time.time() values.
     waiting_payments = await database.pending_payments.find(
-        {"status": "waiting"},
+        {"status": "waiting", "stock_reservation_expires_at": {"$exists": False}},
         {"ref_id": 1, "pay_type": 1, "created_at": 1},
     ).to_list(length=None)
     stale_payments = [p for p in waiting_payments if (_created_at_ts(p.get("created_at")) or time.time()) < cutoff_ts]
@@ -4231,7 +4282,7 @@ async def expire_stale_unpaid_payments_and_orders(timeout_minutes: int = 30) -> 
         "approved", "confirmed", "completed",
     }
     pending_orders = await database.orders.find(
-        {"status": "pending"},
+        {"status": "pending", "stock_reservation_enabled": {"$ne": True}},
         {"order_id": 1, "created_at": 1},
     ).to_list(length=None)
     for order in pending_orders:

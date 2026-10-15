@@ -30,6 +30,7 @@ from config import SUPPORT_USERNAMES
 from utils.crypto import UniqueUsdtAmountUnavailable, generate_unique_usdt_amount
 from utils.messages import commands_text, compact_blank_lines, md_code, telegram_id, order_amount_text
 from utils.i18n import tr, language_name, normalize_lang, SUPPORTED_LANGUAGES
+from utils.stock_subscriptions import subscribe_async, unsubscribe_async, is_subscribed_async
 from handlers.replacements import start_report_from_query
 
 logger = logging.getLogger(__name__)
@@ -806,6 +807,8 @@ def _format_order_delivery_text(order: dict, *, is_refetch: bool = False, lang: 
             f"{tr(lang, 'payment_method')}: {str(order.get('payment_method', 'N/A')).upper()}\n"
             f"{tr(lang, 'status')}: {_status_emoji(status)} {_status_label(status, lang)}"
         )
+        if order.get("api_error_code") == "insufficient_balance":
+            details += "\n\n" + tr(lang, "api_failed_balance")
         if _is_cancelled_pending_stock_order(order):
             note = str(order.get("cancel_note") or "").strip()
             if refund_status in {"waiting_user_choice", "wallet_credited", "refund_requested", "refund_paid"}:
@@ -1143,7 +1146,9 @@ def _api_link_text(api_key: str | None, summary: dict | None = None, lang: str =
     else: lines.append(tr(lang, "api_no_key"))
     lines.extend(["", md_code("Authorization: Bearer YOUR_KEY"), "", tr(lang, "api_endpoints"),
         md_code("GET /api/telegram-buyer/products"), md_code("GET /api/telegram-buyer/balance"),
-        md_code("POST /api/telegram-buyer/purchase"), md_code("GET /api/telegram-buyer/orders/ORDER_ID"), "", tr(lang, "api_instructions")])
+        md_code("POST /api/telegram-buyer/purchase"), md_code("GET /api/telegram-buyer/orders/ORDER_ID"),
+        "", tr(lang, "api_endpoint_url"), md_code(summary["endpoint_url"]) if summary.get("endpoint_url") else tr(lang, "api_endpoint_not_configured"),
+        "", tr(lang, "api_instructions"), "", tr(lang, "api_failed_attempt_hint")])
     return "\n".join(lines)
 
 
@@ -1151,9 +1156,11 @@ def _api_link_keyboard(summary: dict | None = None, lang: str = "en") -> InlineK
     summary = summary or {}
     if summary.get("disabled"):
         return InlineKeyboardMarkup([_back_button(lang)])
-    label = tr(lang, "api_regenerate" if summary.get("enabled") else "api_generate")
+    has_key = summary.get("has_key", summary.get("enabled", False))
+    label = tr(lang, "api_regenerate" if has_key else "api_generate")
     return InlineKeyboardMarkup([
-        [InlineKeyboardButton(label, callback_data="api:regenerate")],
+        [InlineKeyboardButton(label, callback_data="api:regenerate" if has_key else "api:generate")],
+        *([[InlineKeyboardButton(tr(lang, "api_balance_alerts_on" if summary.get("low_balance_alerts_enabled", True) else "api_balance_alerts_off"), callback_data="api:alerts_off" if summary.get("low_balance_alerts_enabled", True) else "api:alerts_on")]] if summary.get("enabled") else []),
         [InlineKeyboardButton(tr(lang, 'api_catalog_button'), callback_data='api_catalog:open')],
         _back_button(lang),
     ])
@@ -1170,8 +1177,8 @@ async def cmd_api(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if await db.is_blocked(user.id):
         await update.message.reply_text(tr(await _user_lang(user.id), "blocked"))
         return
-    api_key, _user_doc = await db.ensure_user_api_key(user.id, user.username or "")
     summary = await db.get_user_api_summary(user.id)
+    api_key = summary.get("api_key") if summary.get("enabled") else None
     await update.message.reply_text(
         _api_link_text(api_key, summary, await _user_lang(update.effective_user.id)),
         parse_mode="Markdown",
@@ -1196,9 +1203,19 @@ async def handle_api_callbacks(update: Update, context: ContextTypes.DEFAULT_TYP
         await query.edit_message_text(_api_link_text(None, summary, await _user_lang(user_id)))
         return
     action = (query.data or "").split(":", 1)[-1]
-    if action == "regenerate":
+    if action in {"alerts_on", "alerts_off"}:
+        if not summary.get("enabled"):
+            return
+        await db.get_db().users.update_one({"user_id": user_id}, {"$set": {"api_low_balance_alerts_enabled": action == "alerts_on"}})
+        summary = await db.get_user_api_summary(user_id)
+        await query.edit_message_reply_markup(reply_markup=_api_link_keyboard(summary, await _user_lang(user_id)))
+        return
+    if action in {"generate", "regenerate"}:
         try:
-            api_key = await db.rotate_user_api_key(user_id, query.from_user.username or "")
+            if action == "generate" or not summary.get("has_key", summary.get("enabled", False)):
+                api_key, _user_doc = await db.ensure_user_api_key(user_id, query.from_user.username or "")
+            else:
+                api_key = await db.rotate_user_api_key(user_id, query.from_user.username or "")
         except PermissionError:
             await query.edit_message_text(tr(await _user_lang(user_id), "api_disabled"))
             return
@@ -1428,8 +1445,8 @@ async def handle_nav_buttons(update: Update, context: ContextTypes.DEFAULT_TYPE)
             return
         _shop_flow.pop(user_id, None)
         _clear_wallet_flow_if_available(user_id)
-        api_key, _user_doc = await db.ensure_user_api_key(user_id, query.from_user.username or "")
         summary = await db.get_user_api_summary(user_id)
+        api_key = summary.get("api_key") if summary.get("enabled") else None
         await query.edit_message_text(
             _api_link_text(api_key, summary, await _user_lang(update.effective_user.id)),
             parse_mode="Markdown",
@@ -1469,6 +1486,55 @@ async def handle_nav_buttons(update: Update, context: ContextTypes.DEFAULT_TYPE)
             reply_markup=_main_menu_keyboard(user_id, lang)
         )
         return
+
+
+async def _stock_watch_keyboard(product, user_id, lang, back_keyboard):
+    if not product.get("_id"):
+        return back_keyboard
+    subscribed = await is_subscribed_async(db.get_db(), product["_id"], user_id)
+    action = "off" if subscribed else "on"
+    label = tr(lang, "btn_stock_notify_cancel" if subscribed else "btn_stock_notify")
+    return InlineKeyboardMarkup([[InlineKeyboardButton(label,
+        callback_data=f"stock_watch:{action}:{product['_id']}")], *back_keyboard.inline_keyboard])
+
+
+async def handle_stock_watch(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    user_id = query.from_user.id
+    lang = await _user_lang(user_id)
+    if not query.message or query.message.chat.type != "private":
+        await query.answer()
+        return
+    if await db.is_blocked(user_id):
+        await query.answer(tr(lang, "blocked"), show_alert=True)
+        return
+    parts = str(query.data or "").split(":")
+    if len(parts) != 3 or parts[1] not in {"on", "off"}:
+        await query.answer()
+        return
+    product = await db.get_product_by_id(parts[2])
+    if not product or product.get("enabled") is False:
+        await query.answer(tr(lang, "product_not_found"), show_alert=True)
+        return
+    if parts[1] == "off":
+        await unsubscribe_async(db.get_db(), product["_id"], user_id)
+        message = tr(lang, "stock_notify_cancelled")
+    else:
+        external = bool(product.get("external_supplier_available")) or await db.product_has_external_supplier_fallback(product)
+        count = (await db.get_combined_available_stock_count(product) if external
+                 else await db.get_available_stock_count(product["name"]))
+        if count > 0:
+            await query.answer(tr(lang, "stock_notify_already_available"))
+            await _show_quantity_prompt(query, user_id, product["name"])
+            return
+        await subscribe_async(db.get_db(), product["_id"], user_id)
+        message = tr(lang, "stock_notify_subscribed")
+    await query.answer(message, show_alert=True)
+    try:
+        await _show_quantity_prompt(query, user_id, product["name"])
+    except BadRequest as error:
+        if "message is not modified" not in str(error).lower():
+            raise
 
 
 async def _show_quantity_prompt(query, user_id: int, product_name: str, *, back_to: str = "shop"):
@@ -1520,6 +1586,7 @@ async def _show_quantity_prompt(query, user_id: int, product_name: str, *, back_
     preorder_max_qty = 0
 
     if stock_count <= 0:
+        back_keyboard = await _stock_watch_keyboard(product, user_id, lang, back_keyboard)
         status = await _preorder_status_for_user(product, user_id)
         preorder_capacity = int(status["total_remaining"] or 0)
         preorder_max_qty = int(status["max_qty"] or 0)
@@ -1822,7 +1889,20 @@ async def _create_checkout_order(
 ) -> str | None:
     product_name = str(product.get("name") or "")
     if not is_preorder:
-        return await db.create_order(user_id, product_name, qty, method, total_inr, total_usdt, username, is_preorder=False)
+        from utils.stock_reservations import reserve_stock_async
+        order_id = await db.create_order(user_id, product_name, qty, method, total_inr, total_usdt, username, is_preorder=False)
+        settings = await db.get_secret_settings()
+        if method.startswith("wallet_") or str(settings.get("stock_reservations_enabled", "1")) == "1":
+            partial = await db.product_has_external_supplier_fallback(product)
+            result = await reserve_stock_async(db.get_db(), order_id, product_name, qty, user_id,
+                minutes=int(settings.get("payment_timeout_minutes") or 30), partial=partial,
+                protected=method.startswith("wallet_"), pending_quantity=await db.get_pending_stock_quantity(product_name))
+            if not result.get("ok"):
+                await db.update_order_status(order_id, "cancelled")
+                key = "stock_checkout_active" if result.get("reason") == "active_checkout" else "qty_or_stock_changed"
+                await context.bot.send_message(user_id, tr(lang, key))
+                return None
+        return order_id
 
     result = await db.create_preorder_order_with_limits(
         user_id,

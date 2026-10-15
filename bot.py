@@ -60,7 +60,7 @@ from handlers.search import cmd_search, handle_search_callback, handle_search_in
 
 from handlers.user import (
     cmd_start, cmd_commands, cmd_support, cmd_shop, cmd_favorites, cmd_language, cmd_orders as cmd_user_orders_command, cmd_replacements, cmd_api,
-    handle_nav_buttons, handle_language_select, handle_product_select, handle_get_order_lookup,
+    handle_nav_buttons, handle_language_select, handle_product_select, handle_get_order_lookup, handle_stock_watch,
     handle_payment_method_select, handle_quantity_input, handle_favorite_button, clear_shop_flow,
     handle_refund_choice, handle_refund_detail_input, is_refund_flow_active, clear_refund_flow, handle_api_callbacks,
 )
@@ -491,7 +491,7 @@ async def clear_input_flows_on_new_command_or_navigation(update: Update, context
         if data == "nav:search" or data == "search:new":
             _clear_user_input_flows(user.id)
             return
-        if data.startswith(("nav:", "product:", "product_id:", "favorite_buy:", "favorite_buy_id:", "wallet_currency:", "report:", "api:")):
+        if data.startswith(("nav:", "product:", "product_id:", "stock_watch:", "favorite_buy:", "favorite_buy_id:", "wallet_currency:", "report:", "api:")):
             clear_search_flow(user.id)
         if data.startswith("channel_gate:"):
             _clear_user_input_flows(user.id)
@@ -500,7 +500,7 @@ async def clear_input_flows_on_new_command_or_navigation(update: Update, context
             return
         # Navigation/product/wallet buttons start a new user flow, so cancel a
         # half-finished report. Do not clear shop flow for payment buttons.
-        if data.startswith(("nav:", "product:", "product_id:", "favorite_buy:", "favorite_buy_id:", "wallet_currency:")):
+        if data.startswith(("nav:", "product:", "product_id:", "stock_watch:", "favorite_buy:", "favorite_buy_id:", "wallet_currency:")):
             clear_report_flow(user.id)
             clear_refund_flow(user.id)
 
@@ -859,6 +859,7 @@ def main():
     app.add_handler(CallbackQueryHandler(handle_language_select, pattern=r"^lang:"))
     app.add_handler(CallbackQueryHandler(handle_nav_buttons, pattern=r"^nav:"))
     app.add_handler(CallbackQueryHandler(handle_product_select, pattern=r"^(product:|product_id:)"))
+    app.add_handler(CallbackQueryHandler(handle_stock_watch, pattern=r"^stock_watch:"))
     app.add_handler(CallbackQueryHandler(handle_favorite_button, pattern=r"^(fav:|fav_id:|favorite_product:|favorite_product_id:|favorite_buy:|favorite_buy_id:)"))
     app.add_handler(CallbackQueryHandler(handle_payment_method_select, pattern=r"^pay:"))
     app.add_handler(CallbackQueryHandler(handle_refund_choice, pattern=r"^refund_(wallet|request):"))
