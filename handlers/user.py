@@ -31,6 +31,7 @@ from utils.crypto import UniqueUsdtAmountUnavailable, generate_unique_usdt_amoun
 from utils.messages import commands_text, compact_blank_lines, md_code, telegram_id, order_amount_text
 from utils.i18n import tr, language_name, normalize_lang, SUPPORTED_LANGUAGES
 from utils.stock_subscriptions import subscribe_async, unsubscribe_async, is_subscribed_async
+from utils.api_documentation import text as api_documentation_text
 from handlers.replacements import start_report_from_query
 
 logger = logging.getLogger(__name__)
@@ -1150,8 +1151,7 @@ def _api_link_text(api_key: str | None, summary: dict | None = None, lang: str =
     lines.extend(["", code("Authorization: Bearer YOUR_KEY"), "", tr(lang, "api_endpoints"),
         code("GET /api/telegram-buyer/products"), code("GET /api/telegram-buyer/balance"),
         code("POST /api/telegram-buyer/purchase"), code("GET /api/telegram-buyer/orders/ORDER_ID"),
-        "", tr(lang, "api_endpoint_url"), code(summary["endpoint_url"]) if summary.get("endpoint_url") else tr(lang, "api_endpoint_not_configured"),
-        "", tr(lang, "api_instructions"), "", tr(lang, "api_failed_attempt_hint")])
+        "", tr(lang, "api_endpoint_url"), code(summary["endpoint_url"]) if summary.get("endpoint_url") else tr(lang, "api_endpoint_not_configured")])
     return "\n".join(lines)
 
 
@@ -1164,9 +1164,14 @@ def _api_link_keyboard(summary: dict | None = None, lang: str = "en") -> InlineK
     return InlineKeyboardMarkup([
         [InlineKeyboardButton(label, callback_data="api:regenerate" if has_key else "api:generate")],
         *([[InlineKeyboardButton(tr(lang, "api_balance_alerts_on" if summary.get("low_balance_alerts_enabled", True) else "api_balance_alerts_off"), callback_data="api:alerts_off" if summary.get("low_balance_alerts_enabled", True) else "api:alerts_on")]] if summary.get("enabled") else []),
+        [InlineKeyboardButton(tr(lang, "api_docs_button"), callback_data="api:docs")],
         [InlineKeyboardButton(tr(lang, 'api_catalog_button'), callback_data='api_catalog:open')],
         _back_button(lang),
     ])
+
+
+def _api_documentation_keyboard(lang="en"):
+    return InlineKeyboardMarkup([[InlineKeyboardButton(tr(lang, "api_docs_back"), callback_data="nav:api")]])
 
 
 async def cmd_api(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1206,6 +1211,15 @@ async def handle_api_callbacks(update: Update, context: ContextTypes.DEFAULT_TYP
         await query.edit_message_text(_api_link_text(None, summary, await _user_lang(user_id)), parse_mode="HTML")
         return
     action = (query.data or "").split(":", 1)[-1]
+    if action == "docs" or action.startswith("docs:"):
+        lang = await _user_lang(user_id)
+        try:
+            await query.edit_message_text(api_documentation_text(summary, lang), parse_mode="HTML",
+                reply_markup=_api_documentation_keyboard(lang))
+        except BadRequest as error:
+            if "message is not modified" not in str(error).lower():
+                raise
+        return
     if action in {"alerts_on", "alerts_off"}:
         if not summary.get("enabled"):
             return
