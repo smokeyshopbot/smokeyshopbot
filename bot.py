@@ -22,8 +22,11 @@ from datetime import datetime, timezone, timedelta
 from telegram import Update
 from telegram.ext import (
     ApplicationBuilder,
+    Application,
     ExtBot,
     CommandHandler,
+    PollAnswerHandler,
+    ChatMemberHandler,
     CallbackQueryHandler,
     MessageHandler,
     filters,
@@ -32,6 +35,7 @@ from telegram.ext import (
 )
 
 from telegram.error import Conflict
+from utils.premium_emoji_bot import PremiumEmojiBot
 from pymongo import MongoClient, ReturnDocument
 from pymongo.errors import DuplicateKeyError, PyMongoError
 
@@ -43,10 +47,20 @@ from config import (
 )
 import database as db
 from utils.i18n import tr
+from utils.data_guard import async_work_guard, async_update_unit
+from utils.telegram_request import WarmTelegramRequest
+
+from handlers.polls import handle_poll_answer, handle_survey_callback, start_poll_watcher
+from handlers.api_receipts import start_api_receipt_watcher, stop_background_services
+from handlers.channel_gate import require_channel_membership, handle_channel_gate_action, handle_membership_update, start_membership_cache_refresh
+from handlers.api_catalog import cmd_api_products, handle_api_catalog
+from utils.update_processor import OrderedUserProcessor
+from utils.update_context import upserts, UpdateCache
+from handlers.search import cmd_search, handle_search_callback, handle_search_input, clear_search_flow
 
 from handlers.user import (
     cmd_start, cmd_commands, cmd_support, cmd_shop, cmd_favorites, cmd_language, cmd_orders as cmd_user_orders_command, cmd_replacements, cmd_api,
-    handle_nav_buttons, handle_language_select, handle_product_select, handle_get_order_lookup,
+    handle_nav_buttons, handle_language_select, handle_product_select, handle_get_order_lookup, handle_stock_watch,
     handle_payment_method_select, handle_quantity_input, handle_favorite_button, clear_shop_flow,
     handle_refund_choice, handle_refund_detail_input, is_refund_flow_active, clear_refund_flow, handle_api_callbacks,
 )
@@ -425,6 +439,7 @@ def _clear_user_input_flows(user_id: int | str | None, *, include_payment_manual
     state is cleared.
     """
     clear_report_flow(user_id)
+    clear_search_flow(user_id)
     clear_shop_flow(user_id)
     clear_wallet_flow(user_id)
     clear_refund_flow(user_id)
@@ -435,7 +450,7 @@ def _clear_user_input_flows(user_id: int | str | None, *, include_payment_manual
 _COMMANDS_THAT_START_A_NEW_FLOW = {
     "start", "commands", "support", "shop", "wallet", "loadwallet",
     "wallethistory", "orders", "replacements", "favorites",
-    "report", "language", "api", "getorder", "getid",
+    "report", "language", "api", "getorder", "getid", "search",
 }
 
 
@@ -473,11 +488,19 @@ async def clear_input_flows_on_new_command_or_navigation(update: Update, context
 
     if update.callback_query:
         data = str(update.callback_query.data or "")
+        if data == "nav:search" or data == "search:new":
+            _clear_user_input_flows(user.id)
+            return
+        if data.startswith(("nav:", "product:", "product_id:", "stock_watch:", "favorite_buy:", "favorite_buy_id:", "wallet_currency:", "report:", "api:")):
+            clear_search_flow(user.id)
+        if data.startswith("channel_gate:"):
+            _clear_user_input_flows(user.id)
+            return
         if data.startswith("report:"):
             return
         # Navigation/product/wallet buttons start a new user flow, so cancel a
         # half-finished report. Do not clear shop flow for payment buttons.
-        if data.startswith(("nav:", "product:", "product_id:", "favorite_buy:", "favorite_buy_id:", "wallet_currency:")):
+        if data.startswith(("nav:", "product:", "product_id:", "stock_watch:", "favorite_buy:", "favorite_buy_id:", "wallet_currency:")):
             clear_report_flow(user.id)
             clear_refund_flow(user.id)
 
@@ -485,6 +508,8 @@ async def clear_input_flows_on_new_command_or_navigation(update: Update, context
 async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     if await db.is_blocked(user_id):
+        return
+    if await handle_search_input(update, context):
         return
 
     # Cancelled-order refund detail input
@@ -606,7 +631,7 @@ async def _record_outgoing_notification(kind: str, method_name: str, result, arg
         logger.warning("Could not record outgoing Telegram %s notification", method_name, exc_info=True)
 
 
-class NotificationRecordingBot(ExtBot):
+class NotificationRecordingBot(PremiumEmojiBot):
     """ExtBot that records sent message IDs for WebAdmin's recent-delete panel.
 
     python-telegram-bot freezes Bot instances, so assigning wrapped methods with
@@ -736,6 +761,15 @@ async def post_init(application):
     except Exception as e:
         logger.exception("❌ Could not start global Binance Pay watcher: %s", e)
 
+    try:
+        await db.refresh_runtime_cache()
+    except Exception as error:
+        logger.warning('Could not warm bot settings (%s).', type(error).__name__)
+    await db.start_runtime_cache_refresh()
+    await start_membership_cache_refresh(application)
+    await db.start_supplier_lookup_refresh()
+    await start_poll_watcher(application)
+    await start_api_receipt_watcher(application)
     logger.info("✅ Bot started in user-only mode. Use WebAdmin for all admin actions.")
 
 
@@ -752,17 +786,46 @@ async def log_runtime_error(update: object, context: ContextTypes.DEFAULT_TYPE) 
     logger.exception("Unhandled bot error", exc_info=error)
 
 
+class CoordinatedApplication(Application):
+    async def process_update(self, update):
+        started_at = time.monotonic()
+        token = upserts.set(UpdateCache())
+        try:
+            async with async_update_unit(db.get_db()):
+                return await super().process_update(update)
+        finally:
+            profile = upserts.get()
+            upserts.reset(token)
+            elapsed = time.monotonic() - started_at
+            if elapsed > 2:
+                stages = '; '.join(f'{name} max={peak:.2f}s/{count} calls' for name, (total, count, peak) in
+                    sorted(profile.timings.items(), key=lambda item: item[1][2], reverse=True)[:8])
+                logger.warning('Slow bot update %s: %.2fs. Stages: %s',
+                               getattr(update, 'update_id', None), elapsed, stages or 'handler processing')
+
+
 def main():
     _log_token_source()
     _acquire_polling_singletons()
     app = (
         ApplicationBuilder()
-        .bot(NotificationRecordingBot(token=BOT_TOKEN))
+        .application_class(CoordinatedApplication)
+        .concurrent_updates(OrderedUserProcessor(8))
+        .bot(NotificationRecordingBot(token=BOT_TOKEN, request=WarmTelegramRequest(connection_pool_size=32),
+                                    get_updates_request=WarmTelegramRequest(connection_pool_size=1)))
         .post_init(post_init)
+        .post_stop(stop_background_services)
         .build()
     )
 
     app.add_error_handler(log_runtime_error)
+    app.add_handler(ChatMemberHandler(handle_membership_update, ChatMemberHandler.CHAT_MEMBER), group=-5)
+    # Recheck current channel membership before every command, message or old menu button.
+    app.add_handler(MessageHandler(filters.ALL, require_channel_membership), group=-4)
+    app.add_handler(CallbackQueryHandler(require_channel_membership), group=-4)
+    # Votes must be recorded even when the shopping maintenance guard is active.
+    app.add_handler(PollAnswerHandler(handle_poll_answer), group=-3)
+    app.add_handler(CallbackQueryHandler(handle_survey_callback, pattern=r'^survey:'), group=-3)
 
     # ── Cancel stale input flows when users start another command/menu action ──
     app.add_handler(MessageHandler(filters.COMMAND, clear_input_flows_on_new_command_or_navigation), group=-2)
@@ -777,6 +840,7 @@ def main():
     app.add_handler(CommandHandler("commands", cmd_commands))
     app.add_handler(CommandHandler("support", cmd_support))
     app.add_handler(CommandHandler("shop", cmd_shop))
+    app.add_handler(CommandHandler("search", cmd_search))
     app.add_handler(CommandHandler("wallet", cmd_wallet))
     app.add_handler(CommandHandler("loadwallet", cmd_load_wallet))
     app.add_handler(CommandHandler("wallethistory", cmd_wallet_history))
@@ -786,11 +850,16 @@ def main():
     app.add_handler(CommandHandler("report", cmd_report))
     app.add_handler(CommandHandler("language", cmd_language))
     app.add_handler(CommandHandler("api", cmd_api))
+    app.add_handler(CommandHandler("apiproducts", cmd_api_products))
 
     # ── User inline button callbacks ──
+    app.add_handler(CallbackQueryHandler(handle_channel_gate_action, pattern=r"^channel_gate:"))
+    app.add_handler(CallbackQueryHandler(handle_api_catalog, pattern=r"^api_catalog:"))
+    app.add_handler(CallbackQueryHandler(handle_search_callback, pattern=r"^(search:|nav:search$)"))
     app.add_handler(CallbackQueryHandler(handle_language_select, pattern=r"^lang:"))
     app.add_handler(CallbackQueryHandler(handle_nav_buttons, pattern=r"^nav:"))
     app.add_handler(CallbackQueryHandler(handle_product_select, pattern=r"^(product:|product_id:)"))
+    app.add_handler(CallbackQueryHandler(handle_stock_watch, pattern=r"^stock_watch:"))
     app.add_handler(CallbackQueryHandler(handle_favorite_button, pattern=r"^(fav:|fav_id:|favorite_product:|favorite_product_id:|favorite_buy:|favorite_buy_id:)"))
     app.add_handler(CallbackQueryHandler(handle_payment_method_select, pattern=r"^pay:"))
     app.add_handler(CallbackQueryHandler(handle_refund_choice, pattern=r"^refund_(wallet|request):"))
