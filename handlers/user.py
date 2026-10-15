@@ -1136,18 +1136,21 @@ async def cmd_replacements(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 def _api_link_text(api_key: str | None, summary: dict | None = None, lang: str = "en") -> str:
+    """Telegram HTML: literal API identifiers must never become Markdown entities."""
+    def code(value):
+        return "<code>" + html.escape(str(value), quote=False) + "</code>"
     summary = summary or {}
     if summary.get("disabled"): return tr(lang, "api_disabled")
     lines = [tr(lang, "api_title"), "", tr(lang, "api_intro"), ""]
     if api_key:
-        lines.extend([tr(lang, "api_your_key"), md_code(api_key), "", tr(lang, "api_key_again")])
+        lines.extend([tr(lang, "api_your_key"), code(api_key), "", tr(lang, "api_key_again")])
     elif summary.get("enabled"):
-        lines.extend([tr(lang, "api_key_active"), tr(lang, "api_key_prefix", prefix=md_code(summary.get("prefix") or "—")), "", tr(lang, "api_legacy_key")])
+        lines.extend([tr(lang, "api_key_active"), tr(lang, "api_key_prefix", prefix=code(summary.get("prefix") or "—")), "", tr(lang, "api_legacy_key")])
     else: lines.append(tr(lang, "api_no_key"))
-    lines.extend(["", md_code("Authorization: Bearer YOUR_KEY"), "", tr(lang, "api_endpoints"),
-        md_code("GET /api/telegram-buyer/products"), md_code("GET /api/telegram-buyer/balance"),
-        md_code("POST /api/telegram-buyer/purchase"), md_code("GET /api/telegram-buyer/orders/ORDER_ID"),
-        "", tr(lang, "api_endpoint_url"), md_code(summary["endpoint_url"]) if summary.get("endpoint_url") else tr(lang, "api_endpoint_not_configured"),
+    lines.extend(["", code("Authorization: Bearer YOUR_KEY"), "", tr(lang, "api_endpoints"),
+        code("GET /api/telegram-buyer/products"), code("GET /api/telegram-buyer/balance"),
+        code("POST /api/telegram-buyer/purchase"), code("GET /api/telegram-buyer/orders/ORDER_ID"),
+        "", tr(lang, "api_endpoint_url"), code(summary["endpoint_url"]) if summary.get("endpoint_url") else tr(lang, "api_endpoint_not_configured"),
         "", tr(lang, "api_instructions"), "", tr(lang, "api_failed_attempt_hint")])
     return "\n".join(lines)
 
@@ -1181,7 +1184,7 @@ async def cmd_api(update: Update, context: ContextTypes.DEFAULT_TYPE):
     api_key = summary.get("api_key") if summary.get("enabled") else None
     await update.message.reply_text(
         _api_link_text(api_key, summary, await _user_lang(update.effective_user.id)),
-        parse_mode="Markdown",
+        parse_mode="HTML",
         reply_markup=_api_link_keyboard(summary, await _user_lang(user.id)),
     )
 
@@ -1200,7 +1203,7 @@ async def handle_api_callbacks(update: Update, context: ContextTypes.DEFAULT_TYP
         return
     summary = await db.get_user_api_summary(user_id)
     if summary.get("disabled"):
-        await query.edit_message_text(_api_link_text(None, summary, await _user_lang(user_id)))
+        await query.edit_message_text(_api_link_text(None, summary, await _user_lang(user_id)), parse_mode="HTML")
         return
     action = (query.data or "").split(":", 1)[-1]
     if action in {"alerts_on", "alerts_off"}:
@@ -1217,12 +1220,12 @@ async def handle_api_callbacks(update: Update, context: ContextTypes.DEFAULT_TYP
             else:
                 api_key = await db.rotate_user_api_key(user_id, query.from_user.username or "")
         except PermissionError:
-            await query.edit_message_text(tr(await _user_lang(user_id), "api_disabled"))
+            await query.edit_message_text(tr(await _user_lang(user_id), "api_disabled"), parse_mode="HTML")
             return
         summary = await db.get_user_api_summary(user_id)
         await query.edit_message_text(
             _api_link_text(api_key, summary, await _user_lang(update.effective_user.id)),
-            parse_mode="Markdown",
+            parse_mode="HTML",
             reply_markup=_api_link_keyboard(summary, await _user_lang(user_id)),
         )
 
@@ -1449,7 +1452,7 @@ async def handle_nav_buttons(update: Update, context: ContextTypes.DEFAULT_TYPE)
         api_key = summary.get("api_key") if summary.get("enabled") else None
         await query.edit_message_text(
             _api_link_text(api_key, summary, await _user_lang(update.effective_user.id)),
-            parse_mode="Markdown",
+            parse_mode="HTML",
             reply_markup=_api_link_keyboard(summary, lang),
         )
         return
