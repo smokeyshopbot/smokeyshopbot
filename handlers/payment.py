@@ -11,7 +11,6 @@ from telegram.ext import ContextTypes
 from telegram import Update
 
 import database as db
-from utils.data_guard import guarded_async
 from utils.i18n import tr
 from config import (
     SUPPORT_USERNAMES, PAYMENT_TIMEOUT_MINUTES, PAYMENT_REMINDER_MINUTES, USDT_VERIFY_INTERVAL, LOW_STOCK_ALERT_THRESHOLD,
@@ -310,20 +309,11 @@ def _format_payment_time_left(seconds_left: int | float) -> str:
     return f"{minutes}m {seconds:02d}s"
 
 
-def _payment_expire_at(pending):
-    import time as _time
-    deadline = pending.get("stock_reservation_expires_at")
-    if deadline:
-        if deadline.tzinfo is None: deadline = deadline.replace(tzinfo=timezone.utc)
-        return deadline.timestamp()
-    return float(pending.get("created_at") or _time.time()) + max(1, PAYMENT_TIMEOUT_MINUTES) * 60
-
-
 def _render_payment_template(template: str, pending: dict | None = None) -> str:
     import time as _time
     pending = pending or {}
     created_at = float(pending.get("created_at") or _time.time())
-    expire_at = _payment_expire_at(pending)
+    expire_at = created_at + max(1, PAYMENT_TIMEOUT_MINUTES) * 60
     remaining = max(0, int(expire_at - _time.time()))
     return (str(template or "")
             .replace("{{TIME_LEFT}}", _format_payment_time_left(remaining))
@@ -1016,9 +1006,7 @@ async def handle_upi_screenshot(update: Update, context: ContextTypes.DEFAULT_TY
         await update.message.reply_text(tr(lang, "session_no_longer_active"))
         return True
 
-    if not await db.set_upi_details(ref_id, payer_name, txn_id, photo.file_id):
-        await update.message.reply_text(tr(lang, "session_no_longer_active"))
-        return True
+    await db.set_upi_details(ref_id, payer_name, txn_id, photo.file_id)
     await update.message.reply_text(tr(lang, "manual_submitted_admin"), parse_mode="Markdown")
     logger.info("UPI proof %s saved for WebAdmin review.", ref_id)
     return True
@@ -1270,9 +1258,7 @@ async def handle_binance_screenshot(update: Update, context: ContextTypes.DEFAUL
         await update.message.reply_text(tr(lang, "session_no_longer_active"))
         return True
 
-    if not await db.set_binance_details(ref_id, binance_name, photo.file_id):
-        await update.message.reply_text(tr(lang, "session_no_longer_active"))
-        return True
+    await db.set_binance_details(ref_id, binance_name, photo.file_id)
     await update.message.reply_text(tr(lang, "binance_manual_submitted"), parse_mode="Markdown")
     logger.info("Binance proof %s saved for WebAdmin review.", ref_id)
     return True
@@ -1526,7 +1512,6 @@ async def notify_low_stock_if_needed(bot, product_name: str):
         pass
 
 
-@guarded_async(lambda: db.get_db())
 async def complete_order(bot, user_id: int, ref_id: str):
     # Claim the order before touching stock. The same paid order can be reached
     # by the background auto-checker, Check Payment button, startup recovery, or
@@ -1549,7 +1534,7 @@ async def complete_order(bot, user_id: int, ref_id: str):
     # If older paid orders are already waiting for this product, do not let
     # a newer payment consume the next stock. Put this order in the same queue.
     if order.get("status") != "pending_stock":
-        if int(order.get("stock_reserved_quantity") or 0) < quantity and await db.has_pending_stock_ahead(product_name, order.get("created_at"), order.get("order_id")):
+        if await db.has_pending_stock_ahead(product_name, order.get("created_at"), order.get("order_id")):
             await db.mark_order_pending_stock(ref_id, delivery_token=delivery_token)
             order["status"] = "pending_stock"
             await _delete_payment_msg_by_bot(bot, ref_id)
@@ -1612,7 +1597,7 @@ async def complete_order(bot, user_id: int, ref_id: str):
         # send stock to the user if we could not attach those items to the order.
         logger.error("Could not finalize delivered order after stock pop ref=%s items=%s", ref_id, len(items))
         try:
-            if fulfillment.get("source") == "local_stock" and not fulfillment.get("reserved_local"):
+            if fulfillment.get("source") == "local_stock":
                 await db.restore_popped_stock_items(
                     product_name,
                     items,
@@ -1648,7 +1633,6 @@ async def complete_order(bot, user_id: int, ref_id: str):
     except Exception as exc:
         logger.exception("Could not drain pending-stock queue after delivering %s: %s", ref_id, exc)
 
-@guarded_async(lambda: db.get_db())
 async def recover_stuck_wallet_orders(bot, limit: int = 100) -> dict:
     """Finalize wallet-paid orders that accidentally stayed plain pending.
 
@@ -1700,7 +1684,6 @@ async def recover_stuck_wallet_orders(bot, limit: int = 100) -> dict:
     return {"checked": len(stuck_orders), "finalized": finalized, "still_pending": still_pending}
 
 
-@guarded_async(lambda: db.get_db())
 async def process_pending_stock_orders(bot, product_name: str, *, limit: int = 100, max_passes: int = 3) -> dict:
     """Deliver paid pending-stock orders for a product, oldest first.
 
@@ -1736,9 +1719,9 @@ async def process_pending_stock_orders(bot, product_name: str, *, limit: int = 1
             qty = int(order.get("quantity", 1) or 1)
             stock_now = await db.get_stock_count(product_name)
             supplier_stock = 0
-            if stock_now < qty:
+            if stock_now < 10:
                 supplier_stock = await db.get_external_supplier_available_stock(product_name)
-            if stock_now + supplier_stock < qty:
+            if max(stock_now, supplier_stock) < qty:
                 blocked_by_stock += 1
                 stop_pass = True
                 break
@@ -1774,7 +1757,7 @@ async def process_pending_stock_orders(bot, product_name: str, *, limit: int = 1
             if not updated:
                 logger.error("Could not finalize pending-stock order after stock pop order=%s", order_id)
                 try:
-                    if fulfillment.get("source") == "local_stock" and not fulfillment.get("reserved_local"):
+                    if fulfillment.get("source") == "local_stock":
                         restored_items += await db.restore_popped_stock_items(
                             product_name,
                             items,
@@ -1852,7 +1835,6 @@ async def _send_wallet_load_status(bot, user_id: int, pending: dict, *, already:
             parse_mode="Markdown"
         )
 
-@guarded_async(lambda: db.get_db())
 async def complete_wallet_load(bot, user_id: int, pending: dict):
     ref_id = pending.get("ref_id", "")
     credited_row = await db.mark_wallet_load_credited(ref_id)
@@ -1868,9 +1850,9 @@ async def complete_wallet_load(bot, user_id: int, pending: dict):
     load_amount = float(credited_row.get("load_amount", 0.0) or 0.0)
 
     if currency == "inr":
-        await db.add_wallet_inr(user_id, load_amount, reference="topup-" + ref_id)
+        await db.add_wallet_inr(user_id, load_amount)
     else:
-        await db.add_wallet_usdt(user_id, load_amount, reference="topup-" + ref_id)
+        await db.add_wallet_usdt(user_id, load_amount)
 
     await _delete_payment_msg_by_bot(bot, ref_id)
     await _send_wallet_load_status(bot, user_id, credited_row, already=False)
@@ -1907,7 +1889,7 @@ async def _payment_timer_worker(context_or_application, ref_id: str):
             if not template or not chat_id or not msg_id:
                 return
             created_at = float(pending.get("created_at") or _time.time())
-            expire_at = _payment_expire_at(pending)
+            expire_at = created_at + max(1, PAYMENT_TIMEOUT_MINUTES) * 60
             remaining = max(0, int(expire_at - _time.time()))
             text = _render_payment_template(template, pending)
             if text != last_text:
@@ -1975,8 +1957,8 @@ async def _payment_notice_worker(context_or_application, ref_id: str):
 
             created_at = float(pending.get("created_at") or _time.time())
             now = _time.time()
-            reminder_at = min(created_at + max(1, PAYMENT_REMINDER_MINUTES) * 60, _payment_expire_at(pending))
-            expire_at = _payment_expire_at(pending)
+            reminder_at = created_at + max(1, PAYMENT_REMINDER_MINUTES) * 60
+            expire_at = created_at + max(1, PAYMENT_TIMEOUT_MINUTES) * 60
 
             if now < reminder_at:
                 await asyncio.sleep(min(reminder_at - now, 60))
@@ -2031,10 +2013,6 @@ async def _send_payment_reminder(bot, pending: dict):
 async def _expire_payment_session(bot, ref_id: str):
     """Atomically expire a still-waiting payment and notify the user."""
     expired = await db.expire_pending_payment_if_waiting(ref_id)
-    if not expired:
-        expired = await db.get_db().pending_payments.find_one_and_update(
-            {"ref_id": ref_id, "status": "expired", "stock_hold_expiry_notice_pending": True},
-            {"$unset": {"stock_hold_expiry_notice_pending": ""}}, return_document=True)
     if not expired:
         return
 
@@ -2096,8 +2074,7 @@ async def _expire_overdue_waiting_payments_with_notice(application) -> int:
             created_at = float(pending.get("created_at") or now)
         except (TypeError, ValueError):
             created_at = now
-        deadline = _payment_expire_at(pending) if pending.get("stock_reservation_expires_at") else created_at + timeout_seconds
-        if now < deadline:
+        if now - created_at < timeout_seconds:
             continue
         await _expire_payment_session(application.bot, str(ref_id))
         expired += 1
@@ -2264,7 +2241,8 @@ async def _scan_waiting_usdt_payments(application):
 
         # Do not let very old waiting rows live forever. The expiry worker should
         # handle this too, but the watcher keeps it safe if the expiry task was lost.
-        if now >= _payment_expire_at(pending):
+        age = now - float(pending.get("created_at") or now)
+        if age > PAYMENT_TIMEOUT_MINUTES * 60:
             await _expire_payment_session(application.bot, ref_id)
             continue
 
@@ -2328,7 +2306,8 @@ async def resume_pending_usdt_payments(application):
         user_id = pending.get("user_id")
         if not ref_id or not unique_usdt or not user_id:
             continue
-        if wall_now >= _payment_expire_at(pending):
+        age = wall_now - float(pending.get("created_at") or wall_now)
+        if age > PAYMENT_TIMEOUT_MINUTES * 60:
             await _expire_payment_session(application.bot, ref_id)
             expired += 1
             continue
@@ -2401,7 +2380,8 @@ async def _scan_waiting_binance_payments(application):
         ref_id = pending.get("ref_id")
         if not ref_id:
             continue
-        if now >= _payment_expire_at(pending):
+        age = now - float(pending.get("created_at") or now)
+        if age > PAYMENT_TIMEOUT_MINUTES * 60:
             await _expire_payment_session(application.bot, ref_id)
             continue
         active_rows.append(pending)

@@ -9,11 +9,10 @@ from __future__ import annotations
 
 import os
 import hashlib
-from pathlib import Path
 from dotenv import load_dotenv
 from pymongo import MongoClient
 
-load_dotenv(Path(__file__).with_name(".env"))
+load_dotenv()
 
 
 def _required(name: str) -> str:
@@ -103,12 +102,10 @@ def _load_secret_settings() -> dict:
         settings["secret_settings_updated_at"] = doc.get("updated_at") if isinstance(doc, dict) else None
         client.close()
         return settings
-    except Exception as error:
-        raise RuntimeError(
-            f"Could not read bot settings from MongoDB ({type(error).__name__}, code {getattr(error, 'code', None)}). "
-            "Check the database credentials, access and DB_NAME in the bot .env. "
-            "Bot and WebAdmin must use the same database."
-        ) from None
+    except Exception:
+        # Keep config import readable; the required-token error below gives the
+        # admin a clear action after WebAdmin is configured.
+        return {}
 
 
 _SECRET_SETTINGS = _load_secret_settings()
