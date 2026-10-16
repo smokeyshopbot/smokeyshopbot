@@ -550,7 +550,7 @@ async def record_sent_notification(
 
 
 from utils.data_guard import AsyncGuardedDatabase
-from utils.wallet_audit import change_wallet_async, event_id
+from utils.wallet_events import change_wallet_async, event_id
 
 
 def get_db():

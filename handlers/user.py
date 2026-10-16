@@ -2026,7 +2026,7 @@ async def handle_payment_method_select(update: Update, context: ContextTypes.DEF
         order_id = await _create_checkout_order(context, user_id, query.from_user.username or "", product, qty, "wallet_inr", total_inr, 0, is_preorder, lang)
         if not order_id:
             return
-        from utils.wallet_audit import event_id
+        from utils.wallet_events import event_id
         await db.get_db().orders.update_one({"order_id": order_id}, {"$set": {"wallet_event_id": event_id(user_id, "inr", "order-" + order_id), "wallet_event_delta": -total_inr}})
         success = await db.deduct_wallet_inr(user_id, total_inr, reference="order-" + order_id)
         if not success:
@@ -2041,7 +2041,7 @@ async def handle_payment_method_select(update: Update, context: ContextTypes.DEF
         order_id = await _create_checkout_order(context, user_id, query.from_user.username or "", product, qty, "wallet_usdt", 0, total_usdt, is_preorder, lang)
         if not order_id:
             return
-        from utils.wallet_audit import event_id
+        from utils.wallet_events import event_id
         await db.get_db().orders.update_one({"order_id": order_id}, {"$set": {"wallet_event_id": event_id(user_id, "usdt", "order-" + order_id), "wallet_event_delta": -total_usdt}})
         success = await db.deduct_wallet_usdt(user_id, total_usdt, reference="order-" + order_id)
         if not success:

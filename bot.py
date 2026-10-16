@@ -48,6 +48,7 @@ from config import (
 import database as db
 from utils.i18n import tr
 from utils.data_guard import async_work_guard, async_update_unit
+from utils.runtime_upgrade import remove_obsolete_state_async
 from utils.telegram_request import WarmTelegramRequest
 
 from handlers.polls import handle_poll_answer, handle_survey_callback, start_poll_watcher
@@ -668,6 +669,7 @@ class NotificationRecordingBot(PremiumEmojiBot):
 async def post_init(application):
     try:
         db_conn = db.get_db()
+        await remove_obsolete_state_async(db_conn)
         await db_conn.users.create_index("user_id", unique=True)
         await db_conn.pending_payments.create_index("ref_id")
         await db_conn.pending_payments.create_index([("user_id", 1), ("status", 1)])
