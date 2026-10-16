@@ -10,6 +10,7 @@ from telegram import InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import ContextTypes
 from telegram import Update
 
+from utils.wallet_credits import WalletCreditReview
 import database as db
 from utils.data_guard import guarded_async
 from utils.i18n import tr
@@ -1855,22 +1856,19 @@ async def _send_wallet_load_status(bot, user_id: int, pending: dict, *, already:
 @guarded_async(lambda: db.get_db())
 async def complete_wallet_load(bot, user_id: int, pending: dict):
     ref_id = pending.get("ref_id", "")
-    credited_row = await db.mark_wallet_load_credited(ref_id)
-
-    if not credited_row:
-        # Already credited or not a wallet payment. Do not add balance again.
-        await _delete_payment_msg_by_bot(bot, ref_id)
-        latest = await db.get_pending_by_ref(ref_id) or pending
-        await _send_wallet_load_status(bot, user_id, latest, already=True)
+    try:
+        credited_row = await db.mark_wallet_load_credited(ref_id)
+    except WalletCreditReview:
+        await bot.send_message(user_id, tr(pending.get("language", "en"), "wallet_credit_review", reference=ref_id))
         return
 
-    currency = credited_row.get("currency", "inr")
-    load_amount = float(credited_row.get("load_amount", 0.0) or 0.0)
-
-    if currency == "inr":
-        await db.add_wallet_inr(user_id, load_amount, reference="topup-" + ref_id)
-    else:
-        await db.add_wallet_usdt(user_id, load_amount, reference="topup-" + ref_id)
+    if not credited_row:
+        latest = await db.get_pending_by_ref(ref_id) or pending
+        if latest.get("wallet_credit_state") != "done":
+            return
+        await _delete_payment_msg_by_bot(bot, ref_id)
+        await _send_wallet_load_status(bot, user_id, latest, already=True)
+        return
 
     await _delete_payment_msg_by_bot(bot, ref_id)
     await _send_wallet_load_status(bot, user_id, credited_row, already=False)

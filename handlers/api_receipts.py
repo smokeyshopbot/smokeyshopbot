@@ -6,8 +6,9 @@ from pymongo import ReturnDocument
 from telegram.error import RetryAfter
 import database as db
 from utils.api_receipts import purchase_receipt
-from utils.notification_limits import notifications_paused, pause_notifications
-from utils.data_guard import guarded_async
+from utils.notification_limits import notifications_paused, pause_notifications, BackgroundBot, NotificationDeferred
+from utils.data_guard import guarded_async, async_work_guard
+from utils.wallet_credits import recover_credits_async
 
 logger = logging.getLogger(__name__)
 
@@ -15,6 +16,7 @@ logger = logging.getLogger(__name__)
 @guarded_async(lambda: db.get_db())
 async def process_api_receipts(bot, limit=10):
     database = db.get_db()
+    bot = BackgroundBot(bot, database)
     now = datetime.now(timezone.utc)
     if await notifications_paused(database):
         return
@@ -33,6 +35,9 @@ async def process_api_receipts(bot, limit=10):
             product = await database.products.find_one({"name": order.get("product_name", "")}) or {}
             result = await bot.send_message(chat_id=order["user_id"], text=purchase_receipt(order, user.get("language", "en"), product))
             fields = {"api_receipt_status": "sent", "api_receipt_sent_at": datetime.now(timezone.utc), "api_receipt_message_id": result.message_id}
+        except NotificationDeferred as exc:
+            fields = {"api_receipt_status": "pending", "api_receipt_next_attempt": datetime.now(timezone.utc) + timedelta(seconds=exc.retry_after)}
+            rate_limited = True
         except RetryAfter as exc:
             delay = await pause_notifications(database, exc.retry_after)
             fields = {"api_receipt_status": "pending", "api_receipt_next_attempt": now + timedelta(seconds=delay)}
@@ -54,13 +59,21 @@ async def start_api_receipt_watcher(application):
         while True:
             try:
                 if time.monotonic() - last_sweep >= 10:
+                    async with async_work_guard(db.get_db()):
+                        await recover_credits_async(db.get_db())
                     from utils.stock_reservations import sweep_reservations_async
                     await sweep_reservations_async(db.get_db())
                     from handlers.payment import _expire_payment_session
                     async for pending in db.get_db().pending_payments.find({"status": "expired", "stock_hold_expiry_notice_pending": True}).limit(10):
                         await _expire_payment_session(application.bot, pending["ref_id"])
                     last_sweep = time.monotonic()
-                await process_api_receipts(application.bot)
+                current = datetime.now(timezone.utc)
+                work = await db.get_db().orders.find_one({'api_purchase': True, '$or': [
+                    {'status': 'delivered', 'api_receipt_status': 'pending', '$or': [
+                        {'api_receipt_next_attempt': {'$exists': False}}, {'api_receipt_next_attempt': {'$lte': current}}]},
+                    {'api_receipt_status': 'sending', 'api_receipt_claimed_at': {'$lt': current - timedelta(minutes=2)}}]}, {'_id': 1})
+                if work:
+                    await process_api_receipts(application.bot)
             except asyncio.CancelledError:
                 raise
             except Exception:

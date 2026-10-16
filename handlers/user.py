@@ -24,6 +24,7 @@ from telegram.ext import ContextTypes
 from telegram.error import BadRequest
 from telegram.helpers import escape_markdown
 
+from utils.wallet_credits import WalletCreditReview
 import database as db
 from utils.product_emojis import label as product_emoji_label, prefix as product_emoji_prefix, normal_prefix, product_heading
 from config import SUPPORT_USERNAMES
@@ -2141,7 +2142,15 @@ async def handle_refund_choice(update: Update, context: ContextTypes.DEFAULT_TYP
         if order.get("refund_wallet_enabled") is False:
             await query.edit_message_text(tr(lang, "refund_order_not_available"))
             return
-        credited = await db.credit_cancelled_order_refund_to_wallet(order_id, user_id)
+        try:
+            credited = await db.credit_cancelled_order_refund_to_wallet(order_id, user_id)
+        except WalletCreditReview:
+            await query.edit_message_text(tr(lang, "wallet_credit_review", reference=order_id))
+            return
+        except Exception:
+            logger.exception("Wallet refund credit failed for %s", order_id)
+            await query.edit_message_text(tr(lang, "wallet_credit_unavailable"))
+            return
         clear_refund_flow(user_id)
         if not credited:
             await query.edit_message_text(tr(lang, "refund_already_handled"))
@@ -2158,6 +2167,9 @@ async def handle_refund_choice(update: Update, context: ContextTypes.DEFAULT_TYP
         return
 
     if action == "refund_request":
+        if order.get("refund_status") == "wallet_credit_pending":
+            await query.edit_message_text(tr(lang, "wallet_credit_unavailable"))
+            return
         if order.get("refund_external_enabled") is False:
             await query.edit_message_text(tr(lang, "refund_order_not_available"))
             return

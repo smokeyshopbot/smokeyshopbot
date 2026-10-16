@@ -5,11 +5,13 @@ import re
 import uuid
 from datetime import datetime, timezone, timedelta
 from telegram.error import RetryAfter, BadRequest
+from pymongo.errors import BulkWriteError
 from telegram.ext import ApplicationHandlerStop
 import database as db
 from utils.poll_validation import audience_query
 from utils.survey import voting_open, survey_text, survey_keyboard, vote_locked, words
-from utils.notification_limits import notifications_paused, pause_notifications
+from utils.notification_limits import (notifications_paused, pause_notifications, BackgroundBot, NotificationDeferred,
+                                       notification_slot_async)
 from utils.data_guard import guarded_async
 
 logger = logging.getLogger(__name__)
@@ -230,7 +232,7 @@ async def _close_group(bot, database, campaign):
         await database.user_polls.update_one({'campaign_id': campaign['campaign_id']},
             {'$set': {'group_results_sent': True}, '$unset': {'group_results_error': ''}})
         return True
-    except RetryAfter:
+    except (RetryAfter, NotificationDeferred):
         raise
     except Exception as exc:
         attempts = campaign.get('group_close_attempts', 0) + 1
@@ -238,6 +240,71 @@ async def _close_group(bot, database, campaign):
         await database.user_polls.update_one({'campaign_id': campaign['campaign_id']}, {'$set': {
             'group_close_attempts': attempts, 'group_results_error': str(exc)[:300]}})
         return attempts >= 3
+
+@guarded_async(lambda: db.get_db())
+async def _send_queued_poll(bot, database, campaign, delivery):
+    cid = campaign['campaign_id']
+    claim = await database.poll_deliveries.update_one({'_id': delivery['_id'], 'status': 'pending'},
+        {'$set': {'status': 'sending', 'updated_at': datetime.now(timezone.utc)}})
+    if not claim.modified_count:
+        return
+    try:
+        # Recheck after pacing as a close/deadline or block can overtake the wait.
+        async with notification_slot_async(database, delivery['user_id']):
+            fresh = await database.user_polls.find_one({'campaign_id': cid}) or {}
+            user = await database.users.find_one({'user_id': delivery['user_id']}) or {}
+            if not voting_open(fresh) or user.get('blocked') or await db.is_maintenance_mode():
+                fields = {'status': 'cancelled' if not voting_open(fresh) or user.get('blocked') else 'pending'}
+            elif campaign.get('format') == 'private_v2':
+                message = await bot.send_message(chat_id=delivery['user_id'], text=survey_text(fresh, delivery.get('language', 'en')),
+                                                 reply_markup=survey_keyboard(fresh, delivery.get('language', 'en')))
+                fields = {'status': 'sent', 'message_id': message.message_id, 'sent_at': datetime.now(timezone.utc)}
+            else:
+                message = await bot.send_poll(chat_id=delivery['user_id'], question=campaign['question'], options=campaign['options'],
+                    is_anonymous=False, allows_multiple_answers=campaign.get('multiple', False), type='regular')
+                fields = {'status': 'sent', 'telegram_poll_id': message.poll.id, 'message_id': message.message_id, 'sent_at': datetime.now(timezone.utc)}
+    except RetryAfter as exc:
+        await pause_notifications(database, exc.retry_after)
+        fields = {'status': 'pending'}
+    except NotificationDeferred:
+        fields = {'status': 'pending'}
+    except Exception as exc:
+        fields = {'status': 'failed', 'error': str(exc)[:300]}
+    fields['updated_at'] = datetime.now(timezone.utc)
+    await database.poll_deliveries.update_one({'_id': delivery['_id'], 'status': 'sending'}, {'$set': fields})
+
+
+@guarded_async(lambda: db.get_db())
+async def _close_queued_poll(bot, database, campaign, delivery):
+    try:
+        if campaign.get('format') == 'private_v2':
+            await _edit(bot, delivery, campaign, results=campaign['final_results'])
+        else:
+            if not delivery.get('native_stopped'):
+                await bot.stop_poll(chat_id=delivery['user_id'], message_id=delivery['message_id'])
+                await database.poll_deliveries.update_one({'_id': delivery['_id']}, {'$set': {'native_stopped': True}})
+            await bot.send_message(chat_id=delivery['user_id'], text=survey_text(campaign, delivery.get('language', 'en'), results=campaign['final_results']))
+        fields = {'status': 'closed', 'telegram_closed_at': datetime.now(timezone.utc)}
+    except RetryAfter as exc:
+        await pause_notifications(database, exc.retry_after)
+        return
+    except NotificationDeferred:
+        return
+    except Exception as exc:
+        attempts = int(delivery.get('close_attempts', 0)) + 1
+        fields = {'close_attempts': attempts, 'error': str(exc)[:300]}
+        if attempts >= 3:
+            fields['status'] = 'close_failed'
+    await database.poll_deliveries.update_one({'_id': delivery['_id']}, {'$set': fields})
+
+
+async def _parallel_deliveries(operation, deliveries):
+    semaphore = asyncio.Semaphore(8)
+    async def one(delivery):
+        async with semaphore:
+            await operation(delivery)
+    await asyncio.gather(*(one(delivery) for delivery in deliveries))
+
 
 @guarded_async(lambda: db.get_db())
 async def process_poll_queue(bot, *, batch_size=20):
@@ -260,35 +327,18 @@ async def process_poll_queue(bot, *, batch_size=20):
                 'final_results': campaign['final_results'], 'results_ready_at': now, 'results_unread': True}})
         if await notifications_paused(database):
             continue
-        async for delivery in database.poll_deliveries.find({'campaign_id': cid, 'status': 'sent'}).limit(batch_size):
-            if remaining <= 0:
-                break
-            remaining -= 1
-            try:
-                if campaign.get('format') == 'private_v2':
-                    await _edit(bot, delivery, campaign, results=campaign['final_results'])
-                else:
-                    if not delivery.get('native_stopped'):
-                        await bot.stop_poll(chat_id=delivery['user_id'], message_id=delivery['message_id'])
-                        await database.poll_deliveries.update_one({'_id': delivery['_id']}, {'$set': {'native_stopped': True}})
-                    await bot.send_message(chat_id=delivery['user_id'], text=survey_text(campaign, delivery.get('language', 'en'), results=campaign['final_results']))
-                fields = {'status': 'closed', 'telegram_closed_at': now}
-            except RetryAfter as exc:
-                await pause_notifications(database, exc.retry_after)
-                return
-            except Exception as exc:
-                attempts = int(delivery.get('close_attempts', 0)) + 1
-                fields = {'close_attempts': attempts, 'error': str(exc)[:300]}
-                if attempts >= 3:
-                    fields['status'] = 'close_failed'
-            await database.poll_deliveries.update_one({'_id': delivery['_id']}, {'$set': fields})
-            await asyncio.sleep(0.1)
+        deliveries = await database.poll_deliveries.find({'campaign_id': cid, 'status': 'sent'}).limit(remaining).to_list(length=remaining) if remaining > 0 else []
+        remaining -= len(deliveries)
+        paced = BackgroundBot(bot, database)
+        await _parallel_deliveries(lambda delivery: _close_queued_poll(paced, database, campaign, delivery), deliveries)
         try:
-            group_done = await _close_group(bot, database, campaign) if remaining > 0 else not (campaign.get('group_poll_job_id') or campaign.get('channel_poll_job_id'))
+            group_done = await _close_group(BackgroundBot(bot, database), database, campaign) if remaining > 0 else not (campaign.get('group_poll_job_id') or campaign.get('channel_poll_job_id'))
             if (campaign.get('group_poll_job_id') or campaign.get('channel_poll_job_id')) and remaining > 0:
                 remaining -= 1
         except RetryAfter as exc:
             await pause_notifications(database, exc.retry_after)
+            return
+        except NotificationDeferred:
             return
         if group_done and not await database.poll_deliveries.count_documents({'campaign_id': cid, 'status': {'$in': ['sent', 'sending']}}):
             failures = await database.poll_deliveries.count_documents({'campaign_id': cid, 'status': 'close_failed'})
@@ -303,10 +353,16 @@ async def process_poll_queue(bot, *, batch_size=20):
         if campaign.get('prepared_through'):
             query = {'$and': [query, {'user_id': {'$gt': campaign['prepared_through']}}]}
         users = await database.users.find(query).sort('user_id', 1).limit(201).to_list(length=201)
-        for user in users[:200]:
-            await database.poll_deliveries.update_one({'campaign_id': cid, 'user_id': user['user_id']}, {'$setOnInsert': {
-                'campaign_id': cid, 'user_id': user['user_id'], 'username': user.get('username', ''),
-                'language': user.get('language', 'en'), 'status': 'pending', 'option_ids': [], 'created_at': now, 'updated_at': now}}, upsert=True)
+        deliveries = [{'campaign_id': cid, 'user_id': user['user_id'], 'username': user.get('username', ''),
+            'language': user.get('language', 'en'), 'status': 'pending', 'option_ids': [], 'created_at': now, 'updated_at': now}
+            for user in users[:200]]
+        if deliveries:
+            try:
+                await database.poll_deliveries.insert_many(deliveries, ordered=False)
+            except BulkWriteError as error:
+                details = error.details or {}
+                if details.get('writeConcernErrors') or any(e.get('code') != 11000 for e in details.get('writeErrors', [])):
+                    raise
         fields = {'prepared_through': users[min(199, len(users)-1)]['user_id']} if users else {}
         if len(users) <= 200:
             fields.update(status='active', started_at=now)
@@ -315,39 +371,21 @@ async def process_poll_queue(bot, *, batch_size=20):
         if remaining <= 0:
             break
         cid = campaign['campaign_id']
-        async for delivery in database.poll_deliveries.find({'campaign_id': cid, 'status': 'pending'}).limit(remaining):
-            if remaining <= 0:
-                break
-            fresh = await database.user_polls.find_one({'campaign_id': cid}) or {}
-            if not voting_open(fresh):
-                break
-            user = await database.users.find_one({'user_id': delivery['user_id']}) or {}
-            if user.get('blocked'):
-                await database.poll_deliveries.update_one({'_id': delivery['_id']}, {'$set': {'status': 'cancelled'}})
-                continue
-            claim = await database.poll_deliveries.update_one({'_id': delivery['_id'], 'status': 'pending'},
-                {'$set': {'status': 'sending', 'updated_at': datetime.now(timezone.utc)}})
-            if not claim.modified_count:
-                continue
-            remaining -= 1
-            try:
-                if campaign.get('format') == 'private_v2':
-                    message = await bot.send_message(chat_id=delivery['user_id'], text=survey_text(fresh, delivery.get('language', 'en')),
-                                                     reply_markup=survey_keyboard(fresh, delivery.get('language', 'en')))
-                    fields = {'status': 'sent', 'message_id': message.message_id, 'sent_at': datetime.now(timezone.utc)}
-                else:
-                    message = await bot.send_poll(chat_id=delivery['user_id'], question=campaign['question'], options=campaign['options'],
-                        is_anonymous=False, allows_multiple_answers=campaign.get('multiple', False), type='regular')
-                    fields = {'status': 'sent', 'telegram_poll_id': message.poll.id, 'message_id': message.message_id, 'sent_at': datetime.now(timezone.utc)}
-            except RetryAfter as exc:
-                await database.poll_deliveries.update_one({'_id': delivery['_id']}, {'$set': {'status': 'pending', 'updated_at': datetime.now(timezone.utc)}})
-                await pause_notifications(database, exc.retry_after)
-                return
-            except Exception as exc:
-                fields = {'status': 'failed', 'error': str(exc)[:300]}
-            fields['updated_at'] = datetime.now(timezone.utc)
-            await database.poll_deliveries.update_one({'_id': delivery['_id']}, {'$set': fields})
-            await asyncio.sleep(0.1)
+        deliveries = await database.poll_deliveries.find({'campaign_id': cid, 'status': 'pending'}).limit(remaining).to_list(length=remaining)
+        remaining -= len(deliveries)
+        await _parallel_deliveries(lambda delivery: _send_queued_poll(bot, database, campaign, delivery), deliveries)
+
+
+async def poll_work_pending(database):
+    """Read-only indexed probes avoid write leases and cleanup writes while idle."""
+    current = datetime.now(timezone.utc)
+    campaign = await database.user_polls.find_one({'$or': [
+        {'status': {'$in': ['queued', 'preparing', 'closing']}},
+        {'status': 'active', '$or': [{'ends_at': {'$lte': current, '$ne': None}}, {'close_requested': True}]}]}, {'_id': 1})
+    if campaign:
+        return True
+    return bool(await database.poll_deliveries.find_one({'$or': [
+        {'status': 'pending'}, {'status': 'sending', 'updated_at': {'$lt': current - timedelta(minutes=2)}}]}, {'_id': 1}))
 
 async def start_poll_watcher(application):
     database = db.get_db()
@@ -355,14 +393,17 @@ async def start_poll_watcher(application):
     await database.user_polls.create_index([('status', 1), ('ends_at', 1)])
     await database.poll_deliveries.create_index([('campaign_id', 1), ('user_id', 1)], unique=True)
     await database.poll_deliveries.create_index('telegram_poll_id', unique=True, sparse=True)
+    await database.poll_deliveries.create_index([('status', 1), ('updated_at', 1)])
     await database.delivery_control.create_index('key', unique=True)
+    await database.delivery_control.create_index('expires_at', expireAfterSeconds=0)
     async def worker():
         while True:
             try:
-                await process_poll_queue(application.bot)
+                if await poll_work_pending(database):
+                    await process_poll_queue(application.bot, batch_size=100)
             except asyncio.CancelledError:
                 raise
             except Exception:
                 logger.exception('Poll queue processing failed')
-            await asyncio.sleep(3)
+            await asyncio.sleep(2)
     application.bot_data['poll_task'] = asyncio.create_task(worker())

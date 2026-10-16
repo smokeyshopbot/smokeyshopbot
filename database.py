@@ -29,6 +29,7 @@ from pymongo.errors import DuplicateKeyError
 from bson import ObjectId
 from config import MONGO_URI, DB_NAME, MONGO_TLS_ALLOW_INVALID_CERTIFICATES, is_admin_id
 from utils.update_context import current_upserts, timed
+from utils.wallet_credits import credit_topup_async, credit_refund_async
 
 _client: Optional[AsyncIOMotorClient] = None
 _db = None
@@ -2721,63 +2722,12 @@ async def get_refund_waiting_order_for_user(order_id: str, user_id: int) -> Opti
     return await get_db().orders.find_one({
         "order_id": clean_order_id,
         "user_id": int(user_id),
-        "refund_status": "waiting_user_choice",
+        "refund_status": {"$in": ["waiting_user_choice", "wallet_credit_pending"]},
     })
 
 
 async def credit_cancelled_order_refund_to_wallet(order_id: str, user_id: int) -> Optional[dict]:
-    """One-time credit of a cancelled paid order into the user's wallet.
-
-    The atomic order update is the idempotency lock; repeated button clicks do
-    not add money twice. Admin-created/manual orders never enter
-    refund_status='waiting_user_choice', so they cannot be credited here.
-    """
-    clean_order_id = str(order_id or "").strip().upper()
-    if not clean_order_id:
-        return None
-    now = datetime.now(timezone.utc)
-    order = await get_db().orders.find_one_and_update(
-        {
-            "order_id": clean_order_id,
-            "user_id": int(user_id),
-            "refund_status": "waiting_user_choice",
-            "refund_wallet_enabled": {"$ne": False},
-            "$or": [
-                {"refund_wallet_credited_at": {"$exists": False}},
-                {"refund_wallet_credited_at": None},
-            ],
-        },
-        {
-            "$set": {
-                "refund_status": "wallet_credited",
-                "refund_choice": "wallet",
-                "refund_wallet_credited_at": now,
-                "refund_completed_at": now,
-            }
-        },
-        return_document=ReturnDocument.AFTER,
-    )
-    if not order:
-        return None
-
-    currency, amount = _refund_currency_amount_from_order(order)
-    if amount <= 0:
-        await get_db().orders.update_one(
-            {"order_id": clean_order_id, "refund_status": "wallet_credited"},
-            {"$set": {"refund_status": "not_eligible", "refund_error": "No refundable amount was found."}},
-        )
-        return None
-
-    await get_db().orders.update_one({"order_id": clean_order_id}, {"$set": {
-        "wallet_refund_event_id": event_id(int(user_id), currency, "refund-" + clean_order_id), "wallet_refund_event_delta": round(amount, 2)}})
-    await change_wallet_async(get_db(), int(user_id), currency, round(amount, 2), reference="refund-" + clean_order_id, source="refund")
-    await get_db().orders.update_one(
-        {"order_id": clean_order_id},
-        {"$set": {"refund_currency": currency, "refund_amount": round(amount, 2)}},
-    )
-    order["refund_currency"] = currency
-    order["refund_amount"] = round(amount, 2)
-    return order
+    return await credit_refund_async(get_db(), order_id, user_id)
 
 
 async def submit_cancelled_order_refund_request(order_id: str, user_id: int, refund_details: str) -> Optional[dict]:
@@ -4044,31 +3994,8 @@ async def get_confirmed_binance_payments_needing_completion() -> list[dict]:
 
 
 async def mark_wallet_load_credited(ref_id: str) -> Optional[dict]:
-    """Atomically mark a wallet top-up as credited.
-
-    Returns the payment row only the first time it is credited. Subsequent calls
-    return None, which prevents duplicate wallet balance updates.
-    """
-    pending = await get_db().pending_payments.find_one({"ref_id": ref_id}) or {}
-    return await get_db().pending_payments.find_one_and_update(
-        {
-            "ref_id": ref_id,
-            "pay_type": "wallet",
-            "$or": [
-                {"wallet_credited_at": None},
-                {"wallet_credited_at": {"$exists": False}},
-            ],
-        },
-        {
-            "$set": {
-                "wallet_credited_at": datetime.now(timezone.utc),
-                "wallet_event_id": event_id(pending.get("user_id"), pending.get("currency", "inr"), "topup-" + ref_id),
-                "wallet_event_delta": round(float(pending.get("load_amount", 0) or 0), 2),
-                "status": "completed",
-            }
-        },
-        return_document=ReturnDocument.AFTER,
-    )
+    # This now applies the idempotent credit before marking the source complete.
+    return await credit_topup_async(get_db(), ref_id)
 
 
 async def set_pending_payment_config(ref_id: str, payment_details: dict):
