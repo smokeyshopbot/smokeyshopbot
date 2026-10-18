@@ -61,6 +61,8 @@ async def start_api_receipt_watcher(application):
                 if time.monotonic() - last_sweep >= 10:
                     async with async_work_guard(db.get_db()):
                         await recover_credits_async(db.get_db())
+                    from handlers.coupons import recover_pending_coupons
+                    await recover_pending_coupons()
                     from utils.stock_reservations import sweep_reservations_async
                     await sweep_reservations_async(db.get_db())
                     from handlers.payment import _expire_payment_session

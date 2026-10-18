@@ -208,7 +208,8 @@ def apply_effective_price_to_product(product: dict, user: dict | None = None, cu
     product["effective_price_group"] = group_key
     product["effective_price_group_label"] = price_group_label(group_key)
     product["effective_price_source"] = source
-    return product
+    from utils.promotions import apply_sale
+    return apply_sale(product)
 
 
 async def get_user_product_custom_price(user_id: int, product_name: str) -> dict | None:
@@ -1873,7 +1874,8 @@ async def fulfill_product_items(product_name: str, quantity: int, *, order_id: s
     order = await database.orders.find_one(order_query) if order_id else None
     if order and order.get("stock_reservation_enabled"):
         from utils.stock_reservations import reserve_stock_async
-        reservation = await reserve_stock_async(database, order_id, product_name, quantity, order["user_id"], protected=True, partial=True)
+        reservation = await reserve_stock_async(database, order_id, product_name, quantity, order["user_id"], protected=True, partial=True,
+                                                pending_quantity=await get_pending_stock_quantity(product_name) if order.get("coupon_redemption_id") else 0)
         if not reservation.get("ok"):
             return {"items": [], "source": "none", "error": "Stock reservation is busy"}
     # Reserve the local portion using an exact-array compare and swap. Paid
@@ -2245,6 +2247,7 @@ async def get_all_products_with_availability(include_disabled: bool = False) -> 
         "price_inr": 1,
         "price_usdt": 1,
         "price_group_prices": 1,
+        "sale": 1,
         "enabled": 1,
         "api_enabled": 1,
         "api_product_id": 1,

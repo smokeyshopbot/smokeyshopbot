@@ -75,6 +75,7 @@ from handlers.payment import (
     recover_stuck_wallet_orders, recover_pending_stock_orders,
     start_pending_stock_recovery_watcher, start_stale_unpaid_expiry_watcher,
 )
+from handlers.coupons import cmd_redeem
 from handlers.wallet import (
     cmd_wallet, cmd_load_wallet, cmd_wallet_history,
     handle_wallet_currency_select, handle_wallet_amount_input, handle_wallet_history_page, clear_wallet_flow,
@@ -451,7 +452,7 @@ def _clear_user_input_flows(user_id: int | str | None, *, include_payment_manual
 _COMMANDS_THAT_START_A_NEW_FLOW = {
     "start", "commands", "support", "shop", "wallet", "loadwallet",
     "wallethistory", "orders", "replacements", "favorites",
-    "report", "language", "api", "getorder", "getid", "search",
+    "report", "language", "api", "getorder", "getid", "search", "redeem",
 }
 
 
@@ -473,6 +474,14 @@ async def clear_input_flows_on_new_command_or_navigation(update: Update, context
     user = update.effective_user
     if not user:
         return
+
+    coupon_state = getattr(context, "user_data", None)
+    is_command = bool(update.message and update.message.text and update.message.text.strip().startswith("/"))
+    is_navigation = bool(update.callback_query and str(update.callback_query.data or "").startswith((
+        "nav:", "product:", "product_id:", "stock_watch:", "favorite_buy:", "favorite_buy_id:",
+        "wallet_currency:", "report:", "api:", "channel_gate:")))
+    if coupon_state is not None and (is_command or is_navigation):
+        coupon_state.pop("coupon_waiting", None)
 
     if update.message and update.message.text and update.message.text.strip().startswith("/"):
         command_name = _command_name_from_text(update.message.text)
@@ -506,10 +515,30 @@ async def clear_input_flows_on_new_command_or_navigation(update: Update, context
             clear_refund_flow(user.id)
 
 
+async def handle_redeem_text_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle pasted/formatted /redeem text without Telegram's command entity."""
+    message = update.effective_message
+    parts = str(getattr(message, "text", "") or "").strip().split()
+    if not parts:
+        return
+    command, separator, recipient = parts[0].casefold().partition("@")
+    if command != "/redeem" or (separator and recipient != context.bot.username.casefold()):
+        return
+    # Raw command text does not pass filters.COMMAND. Reset old input sessions
+    # here as well, before any quantity/search/manual-payment handler sees it.
+    await clear_input_flows_on_new_command_or_navigation(update, context)
+    context.args = parts[1:]
+    await cmd_redeem(update, context)
+
+
 async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     if await db.is_blocked(user_id):
         return
+    if getattr(context, "user_data", {}).get("coupon_waiting"):
+        from handlers.coupons import handle_coupon_input
+        if await handle_coupon_input(update, context):
+            return
     if await handle_search_input(update, context):
         return
 
@@ -540,6 +569,12 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # Shop: quantity
     if await handle_quantity_input(update, context):
         return
+
+    text = str(update.effective_message.text or "").strip()
+    if 8 <= len(text) <= 64 and not any(character.isspace() for character in text) and not text.startswith("/"):
+        from handlers.coupons import handle_coupon_input
+        await handle_coupon_input(update, context)
+
 
 
 async def _field_has_duplicates(collection, field_name: str, *, non_empty_string_only: bool = True) -> bool:
@@ -844,6 +879,10 @@ def main():
     app.add_handler(CommandHandler("shop", cmd_shop))
     app.add_handler(CommandHandler("search", cmd_search))
     app.add_handler(CommandHandler("wallet", cmd_wallet))
+    app.add_handler(CommandHandler("redeem", cmd_redeem))
+    # Telegram may omit BOT_COMMAND for a pasted/formatted command. Keep this
+    # fallback in the same group so normal commands are never redeemed twice.
+    app.add_handler(MessageHandler(filters.TEXT & filters.Regex(r"(?i)^\s*/redeem(?:@[A-Za-z0-9_]+)?(?:\s|$)"), handle_redeem_text_command))
     app.add_handler(CommandHandler("loadwallet", cmd_load_wallet))
     app.add_handler(CommandHandler("wallethistory", cmd_wallet_history))
     app.add_handler(CommandHandler("orders", cmd_user_orders_command))
