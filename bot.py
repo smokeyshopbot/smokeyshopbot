@@ -808,6 +808,7 @@ async def post_init(application):
     await db.start_supplier_lookup_refresh()
     await start_poll_watcher(application)
     await start_api_receipt_watcher(application)
+    logger.info("Performance diagnostics build42 enabled for bot updates (slow threshold: 2 seconds).")
     logger.info("✅ Bot started in user-only mode. Use WebAdmin for all admin actions.")
 
 
