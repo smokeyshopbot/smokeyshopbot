@@ -56,6 +56,7 @@ from handlers.api_receipts import start_api_receipt_watcher, stop_background_ser
 from handlers.channel_gate import require_channel_membership, handle_channel_gate_action, handle_membership_update, start_membership_cache_refresh
 from handlers.api_catalog import cmd_api_products, handle_api_catalog
 from utils.update_processor import OrderedUserProcessor
+from utils.performance import current as performance_current, Profile as PerformanceProfile
 from utils.update_context import upserts, UpdateCache
 from handlers.search import cmd_search, handle_search_callback, handle_search_input, clear_search_flow
 
@@ -653,7 +654,7 @@ async def _record_outgoing_notification(kind: str, method_name: str, result, arg
     """Record an outgoing Telegram message without mutating PTB's frozen Bot object."""
     try:
         chat_id = kwargs.get("chat_id") or (args[0] if args else None)
-        await db.record_sent_notification(
+        db.queue_sent_notification(
             chat_id,
             result,
             text=_outgoing_text_preview_from_kwargs(kind, kwargs, args),
@@ -827,18 +828,22 @@ class CoordinatedApplication(Application):
     async def process_update(self, update):
         started_at = time.monotonic()
         token = upserts.set(UpdateCache())
+        performance = PerformanceProfile()
+        performance_token = performance_current.set(performance)
         try:
             async with async_update_unit(db.get_db()):
                 return await super().process_update(update)
         finally:
             profile = upserts.get()
             upserts.reset(token)
+            performance_current.reset(performance_token)
             elapsed = time.monotonic() - started_at
             if elapsed > 2:
                 stages = '; '.join(f'{name} max={peak:.2f}s/{count} calls' for name, (total, count, peak) in
                     sorted(profile.timings.items(), key=lambda item: item[1][2], reverse=True)[:8])
-                logger.warning('Slow bot update %s: %.2fs. Stages: %s',
-                               getattr(update, 'update_id', None), elapsed, stages or 'handler processing')
+                logger.warning('Slow bot update %s: %.2fs; MongoDB %s commands / %.2fs, slowest %s %.2fs. Stages: %s',
+                    getattr(update, 'update_id', None), elapsed, performance.commands, performance.database_seconds,
+                    performance.slowest[0] or 'none', performance.slowest[1], stages or 'handler processing')
 
 
 def main():

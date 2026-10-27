@@ -276,8 +276,8 @@ def _callback_product_key(data: str) -> tuple[str, str]:
 async def _product_from_callback(data: str) -> tuple[str, dict | None]:
     action, value = _callback_product_key(data)
     if action.endswith("_id"):
-        return action, await db.get_product_by_id(value)
-    return action, await db.get_product(value)
+        return action, await db.get_product_for_display(value, by_id=True)
+    return action, await db.get_product_for_display(value)
 
 
 def _get_order_quantity_limits(product: dict, stock_count: int | None = None) -> tuple[int, int]:
@@ -963,14 +963,14 @@ async def show_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     pending_product = context.user_data.pop('pending_product_link', None)
     if pending_product:
-        product = await db.get_db().products.find_one({'_id': ObjectId(pending_product)})
+        product = await db.get_product_for_display(pending_product, by_id=True)
         if not product:
             await _send_start_text(update, tr(lang, 'product_not_found'))
             return
         from types import SimpleNamespace
         async def edit(text, **kwargs):
             await _send_start_text(update, text, **kwargs)
-        await _show_quantity_prompt(SimpleNamespace(edit_message_text=edit), user.id, product['name'])
+        await _show_quantity_prompt(SimpleNamespace(edit_message_text=edit), user.id, product['name'], product=product)
         return
     await _send_start_text(
         update, _main_menu_text(user.first_name, lang),
@@ -1535,7 +1535,7 @@ async def handle_stock_watch(update: Update, context: ContextTypes.DEFAULT_TYPE)
     if len(parts) != 3 or parts[1] not in {"on", "off"}:
         await query.answer()
         return
-    product = await db.get_product_by_id(parts[2])
+    product = await db.get_product_for_display(parts[2], by_id=True)
     if not product or product.get("enabled") is False:
         await query.answer(tr(lang, "product_not_found"), show_alert=True)
         return
@@ -1560,14 +1560,13 @@ async def handle_stock_watch(update: Update, context: ContextTypes.DEFAULT_TYPE)
             raise
 
 
-async def _show_quantity_prompt(query, user_id: int, product_name: str, *, back_to: str = "shop"):
+async def _show_quantity_prompt(query, user_id: int, product_name: str, *, back_to: str = "shop", product=None):
     """Validate a product and show the quantity prompt without favorite controls."""
     lang = await _user_lang(user_id)
     _shop_flow.pop(user_id, None)
     _clear_wallet_flow_if_available(user_id)
 
-    product = await db.get_product(product_name)
-    product = await db.get_effective_product_for_user(product, user_id) if product else None
+    product = product or await db.get_product_for_display(product_name)
     if not product:
         await query.edit_message_text(
             tr(lang, "product_not_found"),
@@ -1586,7 +1585,7 @@ async def _show_quantity_prompt(query, user_id: int, product_name: str, *, back_
         )
         return
 
-    payment_settings = await db.get_payment_settings()
+    product, payment_settings, stock_count = await db.get_product_display_context(product, user_id)
     if not (
         _payment_enabled(payment_settings, "usdt")
         or _payment_enabled(payment_settings, "upi")
@@ -1601,15 +1600,16 @@ async def _show_quantity_prompt(query, user_id: int, product_name: str, *, back_
         )
         return
 
-    external_supplier_available = bool(product.get("external_supplier_available")) or await db.product_has_external_supplier_fallback(product)
-    stock_count = (await db.get_combined_available_stock_count(product) if external_supplier_available
-                   else await db.get_available_stock_count(product_name))
     is_preorder = False
     preorder_capacity = 0
     preorder_max_qty = 0
 
     if stock_count <= 0:
         back_keyboard = await _stock_watch_keyboard(product, user_id, lang, back_keyboard)
+        if not db.product_preorder_enabled(product):
+            await query.edit_message_text(tr(lang, "product_out_stock", product=display_product),
+                parse_mode="Markdown", reply_markup=back_keyboard)
+            return
         status = await _preorder_status_for_user(product, user_id)
         preorder_capacity = int(status["total_remaining"] or 0)
         preorder_max_qty = int(status["max_qty"] or 0)
@@ -1700,7 +1700,7 @@ async def handle_product_select(update: Update, context: ContextTypes.DEFAULT_TY
             reply_markup=InlineKeyboardMarkup([_back_button(lang)])
         )
         return
-    await _show_quantity_prompt(query, user_id, product["name"], back_to="shop")
+    await _show_quantity_prompt(query, user_id, product["name"], back_to="shop", product=product)
 
 async def handle_quantity_input(update: Update, context: ContextTypes.DEFAULT_TYPE) -> bool:
     """Returns True if the message was consumed as quantity input."""
@@ -2245,7 +2245,7 @@ async def handle_favorite_button(update: Update, context: ContextTypes.DEFAULT_T
                 reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton(tr(lang, "btn_back_favorites"), callback_data="nav:favorites")], _back_button(lang)])
             )
             return
-        await _show_quantity_prompt(query, user_id, product_name, back_to="favorites")
+        await _show_quantity_prompt(query, user_id, product_name, back_to="favorites", product=product)
         return
 
     if action in {"fav", "fav_id"}:

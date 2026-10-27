@@ -29,6 +29,9 @@ from pymongo.errors import DuplicateKeyError
 from bson import ObjectId
 from config import MONGO_URI, DB_NAME, MONGO_TLS_ALLOW_INVALID_CERTIFICATES, is_admin_id
 from utils.update_context import current_upserts, timed
+from utils.performance import monitor
+from utils.display_cache import AsyncDisplayCache
+_DISPLAY_CACHE = AsyncDisplayCache()
 from utils.wallet_credits import credit_topup_async, credit_refund_async
 
 _client: Optional[AsyncIOMotorClient] = None
@@ -39,6 +42,8 @@ _RUNTIME_REFRESHED = {}
 _INTERACTION_TOUCHES = {}
 _RUNTIME_CACHE_TASK = None
 _INTERACTION_TASK = None
+_SENT_NOTIFICATION_QUEUE = []
+_SENT_NOTIFICATION_TASK = None
 logger = logging.getLogger(__name__)
 
 
@@ -563,6 +568,7 @@ def get_db():
             tlsAllowInvalidCertificates=MONGO_TLS_ALLOW_INVALID_CERTIFICATES,
             serverSelectionTimeoutMS=30000,
             minPoolSize=1,
+            event_listeners=[monitor],
         )
         _db = AsyncGuardedDatabase(_client[DB_NAME])
     return _db
@@ -813,7 +819,7 @@ async def upsert_user(user_id: int, username: str = "") -> dict:
         return dict(seen[user_id])
     db = get_db()
     username = (username or "").strip().lstrip("@")
-    existing = await db.users.find_one({"user_id": user_id})
+    existing = await db.users.find_one({"user_id": user_id}, {"wallet_events": 0, "wallet_outbox": 0, "api_wallet_debits": 0})
     now = datetime.now(timezone.utc)
     if existing:
         set_updates: dict[str, Any] = {}
@@ -1278,6 +1284,41 @@ async def get_product(name: str) -> Optional[dict]:
     return await get_db().products.find_one({"name": _name_regex(name)})
 
 
+def _display_product_projection():
+    fields = ('name price_inr price_usdt price_group_prices sale enabled api_enabled api_product_id created_at '
+              'shop_order premium_emoji_id low_stock_threshold min_order_quantity max_order_quantity warranty_days '
+              'description description_en description_es preorder_enabled preorder_max_quantity preorder_total_limit '
+              'external_supplier_fallback_enabled supplier_fallbacks stock_manager_earning_rate_usdt '
+              'stock_manager_owner_rate_usdt').split()
+    return {**{key: 1 for key in fields}, 'actual_stock': _product_stock_count_expr()}
+
+
+@timed('product_metadata')
+async def get_product_for_display(value, *, by_id=False):
+    if by_id:
+        if not ObjectId.is_valid(str(value)):
+            return None
+        query = {'_id': ObjectId(str(value))}
+    else:
+        query = {'name': _name_regex(str(value))}
+    rows = await get_db().products.aggregate([{'$match': query},
+        {'$project': _display_product_projection()}, {'$limit': 1}]).to_list(length=1)
+    return rows[0] if rows else None
+
+
+@timed('product_screen_reads')
+async def get_product_display_context(product, user_id):
+    seen = current_upserts()
+    user = dict(seen[user_id]) if seen is not None and user_id in seen else await get_user(user_id)
+    custom, payment, pending, external = await asyncio.gather(
+        get_user_product_custom_price(user_id, product['name']), get_payment_settings(),
+        get_pending_stock_quantity(product['name']),
+        get_external_supplier_available_stock(product, wait=False))
+    priced = apply_effective_price_to_product(product, user or {'user_id': user_id}, custom)
+    available = max(0, int(product.get('actual_stock') or 0) + external - pending)
+    return priced, payment, available
+
+
 async def get_product_by_id(product_id: str) -> Optional[dict]:
     try:
         oid = ObjectId(str(product_id))
@@ -1722,7 +1763,7 @@ async def start_supplier_lookup_refresh():
 
 
 @timed('vendor_catalogue')
-async def _supplier_catalogue(supplier, *, force_refresh=False):
+async def _supplier_catalogue(supplier, *, force_refresh=False, wait=True):
     global _SUPPLIER_LOOP, _SUPPLIER_SEMAPHORE
     loop = asyncio.get_running_loop()
     if _SUPPLIER_LOOP is not loop:
@@ -1734,6 +1775,9 @@ async def _supplier_catalogue(supplier, *, force_refresh=False):
     cached = _cache_get(key, 30)
     if not force_refresh and isinstance(cached, dict):
         return cached
+    stale = _cache_get(key, 120)
+    if _cache_get(key + ':retry', 5):
+        return stale if isinstance(stale, dict) else {}
     task = _SUPPLIER_TASKS.get(key)
     if task is None:
         async def fetch():
@@ -1755,6 +1799,8 @@ async def _supplier_catalogue(supplier, *, force_refresh=False):
                 raise
             except Exception as error:
                 logger.warning('Vendor catalogue check failed (%s). Check vendor URL and API access.', type(error).__name__)
+                _cache_set(key + ':retry', True)
+                return stale if isinstance(stale, dict) else {}
             _cache_set(key, counts)
             return counts
         task = asyncio.create_task(fetch())
@@ -1763,13 +1809,15 @@ async def _supplier_catalogue(supplier, *, force_refresh=False):
             if _SUPPLIER_TASKS.get(key) is finished:
                 _SUPPLIER_TASKS.pop(key, None)
         task.add_done_callback(completed)
+    if not wait:
+        return stale if isinstance(stale, dict) else {}
     try:
         return await asyncio.wait_for(asyncio.shield(task), timeout=3.5)
     except asyncio.TimeoutError:
         return {}
 
 
-async def get_external_supplier_available_stock(product_or_name: Any, *, cache_seconds: int = 30, suppliers=None) -> int:
+async def get_external_supplier_available_stock(product_or_name: Any, *, cache_seconds: int = 30, suppliers=None, wait=True) -> int:
     product = product_or_name if isinstance(product_or_name, dict) else await get_product(str(product_or_name or ''))
     fallbacks = _normalize_supplier_fallbacks(product)
     if not fallbacks:
@@ -1783,7 +1831,7 @@ async def get_external_supplier_available_stock(product_or_name: Any, *, cache_s
         supplier = suppliers.get(row['supplier_id'])
         if not supplier:
             return 0
-        counts = await _supplier_catalogue(supplier)
+        counts = await _supplier_catalogue(supplier, wait=wait)
         return int(counts.get(row['supplier_product_id'], 0))
     return max(await asyncio.gather(*(available(row) for row in fallbacks)), default=0)
 
@@ -2234,6 +2282,11 @@ async def claim_restock_notification_slot(
 
 @timed('catalogue')
 async def get_all_products_with_availability(include_disabled: bool = False) -> list[dict]:
+    return await _DISPLAY_CACHE.get(('catalogue', id(get_db()), include_disabled),
+        lambda: _load_products_for_display(include_disabled), seconds=2)
+
+
+async def _load_products_for_display(include_disabled: bool = False) -> list[dict]:
     """Return products with stock/preorder availability using bulk queries.
 
     The old version queried pending/preorder counts once per product and also
@@ -2307,7 +2360,7 @@ async def get_all_products_with_availability(include_disabled: bool = False) -> 
             suppliers[str(supplier['_id'])] = supplier
     async def load_external(product):
         if product.get("external_supplier_stock") is None:
-            available = await get_external_supplier_available_stock(product, suppliers=suppliers)
+            available = await get_external_supplier_available_stock(product, suppliers=suppliers, wait=False)
             product["external_supplier_stock"] = available
             product["available_stock"] = max(0, product["actual_stock"] + available - product["pending_stock_quantity"])
     await asyncio.gather(*(load_external(product) for product in products))
@@ -3322,7 +3375,7 @@ def _clean_payment_settings(settings: dict | None) -> dict:
 
 
 async def get_payment_settings() -> dict:
-    value = await get_setting_cached(PAYMENT_SETTINGS_KEY, None, ttl_seconds=5.0)
+    value = await get_setting_cached(PAYMENT_SETTINGS_KEY, {}, ttl_seconds=5.0)
     return _clean_payment_settings(value if isinstance(value, dict) else None)
 
 
@@ -3453,8 +3506,29 @@ async def refresh_runtime_cache():
             _cache_set('secret_settings_full', settings)
 
 
+def queue_sent_notification(*args, **kwargs):
+    # Bounded telemetry queue; dropping a UI log never changes an order/wallet.
+    if len(_SENT_NOTIFICATION_QUEUE) >= 2000:
+        _SENT_NOTIFICATION_QUEUE.pop(0)
+        logger.warning('Recent notification log buffer is full; oldest UI log was dropped.')
+    _SENT_NOTIFICATION_QUEUE.append((args, kwargs))
+
+
+async def flush_sent_notifications():
+    from utils.data_guard import async_work_guard
+    batch = list(_SENT_NOTIFICATION_QUEUE[:100])
+    if not batch:
+        return
+    async with async_work_guard(get_db()):
+        for entry in batch:
+            args, kwargs = entry
+            await record_sent_notification(*args, **kwargs)
+            if _SENT_NOTIFICATION_QUEUE and _SENT_NOTIFICATION_QUEUE[0] is entry:
+                _SENT_NOTIFICATION_QUEUE.pop(0)
+
+
 async def start_runtime_cache_refresh():
-    global _RUNTIME_CACHE_TASK, _INTERACTION_TASK
+    global _RUNTIME_CACHE_TASK, _INTERACTION_TASK, _SENT_NOTIFICATION_TASK
     async def worker(name, action):
         while True:
             try:
@@ -3468,15 +3542,21 @@ async def start_runtime_cache_refresh():
         _RUNTIME_CACHE_TASK = asyncio.create_task(worker('settings', refresh_runtime_cache))
     if _INTERACTION_TASK is None or _INTERACTION_TASK.done():
         _INTERACTION_TASK = asyncio.create_task(worker('activity', flush_user_interactions))
+    if _SENT_NOTIFICATION_TASK is None or _SENT_NOTIFICATION_TASK.done():
+        _SENT_NOTIFICATION_TASK = asyncio.create_task(worker('notification log', flush_sent_notifications))
 
 
 async def stop_runtime_cache_refresh():
-    global _RUNTIME_CACHE_TASK, _INTERACTION_TASK
-    tasks = [task for task in (_RUNTIME_CACHE_TASK, _INTERACTION_TASK) if task is not None]
+    global _RUNTIME_CACHE_TASK, _INTERACTION_TASK, _SENT_NOTIFICATION_TASK
+    tasks = [task for task in (_RUNTIME_CACHE_TASK, _INTERACTION_TASK, _SENT_NOTIFICATION_TASK) if task is not None]
     for task in tasks:
         task.cancel()
     await asyncio.gather(*tasks, return_exceptions=True)
-    _RUNTIME_CACHE_TASK = _INTERACTION_TASK = None
+    _RUNTIME_CACHE_TASK = _INTERACTION_TASK = _SENT_NOTIFICATION_TASK = None
+    try:
+        await asyncio.wait_for(flush_sent_notifications(), timeout=3)
+    except Exception as error:
+        logger.warning("Could not flush final UI notification logs (%s).", type(error).__name__)
     try:
         await asyncio.wait_for(flush_user_interactions(), timeout=3)
     except Exception as error:
