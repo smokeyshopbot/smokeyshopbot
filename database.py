@@ -1133,7 +1133,9 @@ def buyer_api_key_prefix(api_key: str) -> str:
 async def get_user_api_summary(user_id: int) -> dict:
     user = await get_user(user_id) or {}
     settings = await get_secret_settings()
+    api_state = await get_db().settings.find_one({'key': 'buyer_api_status'}, {'value.enabled': 1}) or {}
     return {
+        "maintenance": (api_state.get('value') or {}).get('enabled') is False,
         "enabled": user.get("api_enabled") is not False and bool(user.get("api_key_hash")),
         "has_key": bool(user.get("api_key_hash")),
         "disabled": user.get("api_enabled") is False,

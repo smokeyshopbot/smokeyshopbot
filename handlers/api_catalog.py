@@ -24,6 +24,9 @@ async def display(update, context, page=0):
     if not update.effective_chat or update.effective_chat.type != 'private':
         text = tr(lang, 'api_private')
         rows = []
+    elif summary.get('maintenance'):
+        text = tr(lang, 'api_maintenance')
+        rows = [[InlineKeyboardButton(tr(lang, 'api_title_plain'), callback_data='nav:api')]]
     elif await db.is_blocked(uid) or summary.get('disabled'):
         text = tr(lang, 'api_disabled')
         rows = [[InlineKeyboardButton(tr(lang, 'api_title_plain'), callback_data='nav:api')]]

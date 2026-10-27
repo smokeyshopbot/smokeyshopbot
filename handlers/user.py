@@ -1146,6 +1146,7 @@ def _api_link_text(api_key: str | None, summary: dict | None = None, lang: str =
     def code(value):
         return "<code>" + html.escape(str(value), quote=False) + "</code>"
     summary = summary or {}
+    if summary.get("maintenance"): return tr(lang, "api_maintenance")
     if summary.get("disabled"): return tr(lang, "api_disabled")
     lines = [tr(lang, "api_title"), "", tr(lang, "api_intro"), ""]
     if api_key:
@@ -1162,7 +1163,7 @@ def _api_link_text(api_key: str | None, summary: dict | None = None, lang: str =
 
 def _api_link_keyboard(summary: dict | None = None, lang: str = "en") -> InlineKeyboardMarkup:
     summary = summary or {}
-    if summary.get("disabled"):
+    if summary.get("disabled") or summary.get("maintenance"):
         return InlineKeyboardMarkup([_back_button(lang)])
     has_key = summary.get("has_key", summary.get("enabled", False))
     label = tr(lang, "api_regenerate" if has_key else "api_generate")
@@ -1212,7 +1213,7 @@ async def handle_api_callbacks(update: Update, context: ContextTypes.DEFAULT_TYP
     if not query.message or query.message.chat.type != "private":
         return
     summary = await db.get_user_api_summary(user_id)
-    if summary.get("disabled"):
+    if summary.get("disabled") or summary.get("maintenance"):
         await query.edit_message_text(_api_link_text(None, summary, await _user_lang(user_id)), parse_mode="HTML")
         return
     action = (query.data or "").split(":", 1)[-1]
