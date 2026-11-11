@@ -10,7 +10,7 @@ import database as db
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.error import BadRequest, RetryAfter, TelegramError
 from telegram.ext import ApplicationHandlerStop
-from utils.channel_gate_settings import channel_gate_enabled, chat_member_is_joined, validate_channel_settings
+from utils.channel_gate_settings import channel_gate_enabled, chat_member_is_joined, validate_channel_settings, required_chats
 from utils.i18n import LANGUAGE_NAMES, normalize_lang, tr
 
 logger = logging.getLogger(__name__)
@@ -26,7 +26,10 @@ async def _language(update, saved_user, enabled):
 def _keyboard(settings, lang, enabled, unavailable=False):
     rows = []
     if not unavailable:
-        rows.append([InlineKeyboardButton(tr(lang, "btn_join_channel"), url=settings["required_channel_join_url"])])
+        for chat in settings.get('join_targets', []):
+            label = (chat.get('button_text_es') if lang == 'es' else '') or chat.get('button_text')
+            label = label or tr(lang, 'btn_join_channel' if chat.get('primary') else 'btn_join_chat')
+            rows.append([InlineKeyboardButton(label, url=chat['join_url'])])
     rows.append([InlineKeyboardButton(tr(lang, "btn_retry_channel_check" if unavailable else "btn_check_channel_join"), callback_data=CALLBACK_PREFIX + "check")])
     if len(enabled) > 1:
         rows.append([InlineKeyboardButton(LANGUAGE_NAMES[code], callback_data=CALLBACK_PREFIX + "language:" + code) for code in enabled])
@@ -59,22 +62,24 @@ def _ttl(settings):
 async def handle_membership_update(update, context):
     event = update.chat_member
     settings = await db.get_secret_settings()
-    channel = str(settings.get('required_channel_id') or '').strip()
-    matches = (channel == str(event.chat.id) or
-               channel.casefold() == '@' + str(event.chat.username or '').casefold())
+    try:
+        chats = required_chats(settings)
+    except ValueError:
+        return
+    matches = [chat['chat_id'] for chat in chats if (
+        chat['chat_id'] == str(event.chat.id) or
+        chat['chat_id'].casefold() == '@' + str(event.chat.username or '').casefold())]
     if not matches:
         return
     cache = context.bot_data.setdefault('channel_membership_cache', {})
     uid = event.new_chat_member.user.id
-    for key in list(cache):
-        if key[1] == uid:
-            cache.pop(key, None)
-    key = (channel, uid)
-    # Only keep revisions for in-flight checks. A leave event must never be
-    # overwritten by a background request that began before the user left.
-    if context.bot_data.get('channel_membership_inflight', {}).get(key):
-        context.bot_data.setdefault('channel_membership_revisions', {})[key] = (
-            time.monotonic_ns(), chat_member_is_joined(event.new_chat_member))
+    for channel in matches:
+        key = (channel, uid)
+        cache.pop(key, None)
+        # A newer membership event must not be overwritten by an older RPC.
+        if context.bot_data.get('channel_membership_inflight', {}).get(key):
+            context.bot_data.setdefault('channel_membership_revisions', {})[key] = (
+                time.monotonic_ns(), chat_member_is_joined(event.new_chat_member))
     # Telegram's leave/join events invalidate the cached status immediately.
 
 
@@ -89,17 +94,25 @@ async def _check_membership(context, settings, user_id, force=False, refresh=Fal
     if context.bot_data.get("channel_membership_retry_until", 0) > time.monotonic():
         return None
     channel_id = settings["required_channel_id"]
-    if channel_id.startswith("-100"):
+    if channel_id.startswith("-"):
         channel_id = int(channel_id)
     inflight = context.bot_data.setdefault('channel_membership_inflight', {})
     revisions = context.bot_data.setdefault('channel_membership_revisions', {})
     revision = revisions.get(key)
     inflight[key] = inflight.get(key, 0) + 1
     try:
-        member = await context.bot.get_chat_member(
-            chat_id=channel_id, user_id=user_id,
-            read_timeout=3, connect_timeout=3, write_timeout=3, pool_timeout=3,
-        )
+        loop = asyncio.get_running_loop()
+        guard = context.bot_data.get('channel_membership_semaphore')
+        if guard is None or guard[0] is not loop:
+            guard = (loop, asyncio.Semaphore(4))
+            context.bot_data['channel_membership_semaphore'] = guard
+        async with guard[1]:
+            if context.bot_data.get('channel_membership_retry_until', 0) > time.monotonic():
+                return None
+            member = await context.bot.get_chat_member(
+                chat_id=channel_id, user_id=user_id,
+                read_timeout=3, connect_timeout=3, write_timeout=3, pool_timeout=3,
+            )
         joined = chat_member_is_joined(member)
         if revisions.get(key) != revision:
             # Trust the newer signed membership event, not the old RPC result.
@@ -131,22 +144,23 @@ async def refresh_recent_memberships(context):
     if not channel_gate_enabled(raw.get('required_channel_enabled')) or not _ttl(raw):
         return
     try:
-        settings = validate_channel_settings(True, raw.get('required_channel_id'), raw.get('required_channel_join_url'))
+        chats = required_chats(raw)
     except ValueError:
         return
-    settings['required_channel_cache_seconds'] = raw.get('required_channel_cache_seconds', 30)
+    settings_by_id = {chat['chat_id']: {'required_channel_id': chat['chat_id'],
+        'required_channel_cache_seconds': raw.get('required_channel_cache_seconds', 30)} for chat in chats}
     cache = context.bot_data.setdefault('channel_membership_cache', {})
     recent = context.bot_data.setdefault('channel_membership_recent', {})
     current = time.monotonic()
     for key, last_seen in list(recent.items()):
-        if last_seen < current - 300 or key[0] != settings['required_channel_id']:
+        if last_seen < current - 300 or key[0] not in settings_by_id:
             recent.pop(key, None)
             cache.pop(key, None)
-    ahead = min(10, max(0.5, _ttl(settings) / 3))
+    ahead = min(10, max(0.5, _ttl(raw) / 3))
     due = sorted([(key, value) for key, value in cache.items() if key in recent and value[0] <= current + ahead],
                  key=lambda row: row[1][0])[:4]
     for key, _ in due:
-        await _check_membership(context, settings, key[1], force=True, refresh=True)
+        await _check_membership(context, settings_by_id[key[0]], key[1], force=True, refresh=True)
         if context.bot_data.get('channel_membership_retry_until', 0) > time.monotonic():
             break
 
@@ -171,6 +185,10 @@ async def start_membership_cache_refresh(application):
 async def require_channel_membership(update, context):
     user = update.effective_user
     if not user or user.is_bot:
+        return
+    # This informational command must work even before the user has joined.
+    text = str(getattr(getattr(update, 'message', None), 'text', '') or '')
+    if re.fullmatch(r'/group(?:@\w+)?(?:\s.*)?', text.strip(), flags=re.IGNORECASE):
         return
     raw_settings = await db.get_secret_settings()
     message = getattr(update, 'message', None)
@@ -200,19 +218,25 @@ async def require_channel_membership(update, context):
         await _show_prompt(update, context, tr(lang, "blocked"))
         raise ApplicationHandlerStop
     try:
-        settings = validate_channel_settings(True, raw_settings.get("required_channel_id"), raw_settings.get("required_channel_join_url"))
-        settings['required_channel_cache_seconds'] = raw_settings.get('required_channel_cache_seconds', 30)
-        joined = await _check_membership(context, settings, user.id, force=data == CALLBACK_PREFIX + 'check')
+        chats = required_chats(raw_settings)
+        checks = await asyncio.gather(*(_check_membership(context, {
+            'required_channel_id': chat['chat_id'],
+            'required_channel_cache_seconds': raw_settings.get('required_channel_cache_seconds', 30)},
+            user.id, force=data == CALLBACK_PREFIX + 'check') for chat in chats))
+        settings = {'join_targets': [chat for chat, checked in zip(chats, checks) if checked is not True]}
+        joined = True if all(checked is True for checked in checks) else None if None in checks else False
+        recent = context.bot_data.setdefault('channel_membership_recent', {})
+        for chat, checked in zip(chats, checks):
+            if checked is True:
+                key = (chat['chat_id'], user.id)
+                if len(recent) >= 10000 and key not in recent:
+                    recent.pop(next(iter(recent)), None)
+                recent[key] = time.monotonic()
     except ValueError:
-        logger.error("Required channel settings are invalid. Correct them in WebAdmin Secret Settings.")
+        logger.error("Required join settings are invalid. Correct them in WebAdmin Secret Settings.")
         settings = {}
         joined = None
     if joined is True:
-        recent = context.bot_data.setdefault('channel_membership_recent', {})
-        key = (settings['required_channel_id'], user.id)
-        if len(recent) >= 10000 and key not in recent:
-            recent.pop(next(iter(recent)), None)
-        recent[key] = time.monotonic()
         # No prompt, no persistent exemption. The next action checks membership again.
         return
     if query:
@@ -220,9 +244,11 @@ async def require_channel_membership(update, context):
         if product_link:
             context.user_data['pending_product_link'] = product_link.group(1).lower()
     unavailable = joined is None
-    key = "channel_check_unavailable" if unavailable else "channel_join_required"
+    multi = bool(raw_settings.get('required_join_chats'))
+    key = ("join_chats_check_unavailable" if unavailable else "join_chats_required") if multi else (
+        "channel_check_unavailable" if unavailable else "channel_join_required")
     if query:
-        alert_key = key if unavailable else "channel_not_joined"
+        alert_key = key if unavailable else "join_chats_not_joined" if multi else "channel_not_joined"
         await query.answer(tr(lang, alert_key), show_alert=True)
     await _show_prompt(update, context, tr(lang, key), _keyboard(settings, lang, enabled, unavailable))
     raise ApplicationHandlerStop

@@ -54,6 +54,7 @@ from utils.telegram_request import WarmTelegramRequest
 from handlers.polls import handle_poll_answer, handle_survey_callback, start_poll_watcher
 from handlers.api_receipts import start_api_receipt_watcher, stop_background_services
 from handlers.channel_gate import require_channel_membership, handle_channel_gate_action, handle_membership_update, start_membership_cache_refresh
+from handlers.group import cmd_group
 from handlers.api_catalog import cmd_api_products, handle_api_catalog
 from utils.update_processor import OrderedUserProcessor
 from utils.performance import current as performance_current, Profile as PerformanceProfile
@@ -403,6 +404,8 @@ async def maintenance_guard(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
     if not user:
         return
+    if update.message and re.fullmatch(r'/group(?:@\w+)?(?:\s.*)?', str(getattr(update.message, 'text', '') or '').strip(), flags=re.IGNORECASE):
+        return  # Information only; no shop/payment access is granted.
 
     # Fast path: when maintenance is OFF, avoid the extra secret-settings/admin
     # exemption lookup on every single user command/callback. This keeps normal
@@ -808,7 +811,7 @@ async def post_init(application):
     await db.start_supplier_lookup_refresh()
     await start_poll_watcher(application)
     await start_api_receipt_watcher(application)
-    logger.info("Performance diagnostics build46 enabled for bot updates (slow threshold: 2 seconds).")
+    logger.info("Performance diagnostics build47 enabled for bot updates (slow threshold: 2 seconds).")
     logger.info("✅ Bot started in user-only mode. Use WebAdmin for all admin actions.")
 
 
@@ -863,7 +866,7 @@ def main():
 
     app.add_error_handler(log_runtime_error)
     app.add_handler(ChatMemberHandler(handle_membership_update, ChatMemberHandler.CHAT_MEMBER), group=-5)
-    # Recheck current channel membership before every command, message or old menu button.
+    # Require every configured channel/group before shop commands or old buttons.
     app.add_handler(MessageHandler(filters.ALL, require_channel_membership), group=-4)
     app.add_handler(CallbackQueryHandler(require_channel_membership), group=-4)
     # Votes must be recorded even when the shopping maintenance guard is active.
@@ -881,6 +884,7 @@ def main():
     # ── User commands ──
     app.add_handler(CommandHandler("start", cmd_start))
     app.add_handler(CommandHandler("commands", cmd_commands))
+    app.add_handler(CommandHandler("group", cmd_group))
     app.add_handler(CommandHandler("support", cmd_support))
     app.add_handler(CommandHandler("shop", cmd_shop))
     app.add_handler(CommandHandler("search", cmd_search))
